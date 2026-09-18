@@ -186,7 +186,7 @@ def apply_settings(grafana_url: str, payload: dict[str, Any], *, replace_system_
     try:
         # Prompt replacement requires the operator's explicit opt-in.
         with urllib.request.urlopen(urllib.request.Request(url, headers=auth_headers()), timeout=30) as resp:
-            existing = json.loads(resp.read()).get("jsonData", {})
+            existing = json.loads(resp.read()).get("jsonData") or {}  # null on a fresh install
         request_payload["jsonData"] = {**existing, **payload["jsonData"]}
         if "builtInMCPToolSelections" in existing:
             request_payload["jsonData"]["builtInMCPToolSelections"] = existing["builtInMCPToolSelections"]

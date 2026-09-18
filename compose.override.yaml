@@ -1,0 +1,10 @@
+# Local development overlay (auto-loaded by `docker compose`): serve the plugins
+# built from this checkout straight from their dist directories and install the
+# official Grafana LLM app. (Infinity 3.11.2 is no longer in the catalog; 3.11.1 is the closest.) Rebuild a plugin, then `docker compose restart grafana`.
+services:
+  grafana:
+    environment:
+      - GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource 3.11.1,esnet-matrix-panel 2.0.1,grafana-llm-app 1.0.8
+    volumes:
+      - ./ask-o11y/dist:/var/lib/grafana/plugins/consensys-asko11y-app:ro
+      - ./grafana-panels/asko11y-plotly-panel/dist:/var/lib/grafana/plugins/asko11y-plotly-panel:ro

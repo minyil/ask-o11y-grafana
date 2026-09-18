@@ -1,7 +1,8 @@
 # Local integration only. Production must use gVisor or Kata and API authentication.
+# Port 8090: 8080 is commonly taken on developer machines.
 [server]
 host = "127.0.0.1"
-port = 8080
+port = 8090
 max_sandbox_timeout_seconds = 3600
 
 [log]
@@ -9,7 +10,7 @@ level = "INFO"
 
 [runtime]
 type = "docker"
-execd_image = "sha256:40820c279764f7b82621d87fa725b645138a2f4c0ac4868399b4ffb29aaee212"
+execd_image = "sha256:81a92f5c76d19a64b9dc4a55be2f8e86bc12ef9b80266dacdfbc4a9faa1cdf13"
 
 [storage]
 allowed_host_paths = ["/var/empty/opensandbox"]
