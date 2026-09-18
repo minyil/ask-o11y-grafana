@@ -2,55 +2,13 @@ package plugin
 
 import _ "embed"
 
+// DefaultSystemPrompt is the always-on analyst persona for this fork. Upstream
+// observability workflows live in bundled skills under pkg/skills/bundled/ and
+// remain loadable on demand; the analysis guidance below is intentionally
+// always present rather than a skill because every conversation is analysis.
+//
 //go:embed analyst_prompt.md
 var DefaultSystemPrompt string
-
-//go:embed skills/analysis/SKILL.md
-var analysisSkill string
-
-const DefaultInvestigationModeSystemAddendum = `## Alert investigation mode (this request)
-
-The user started this turn from an alert notification. Prioritize **precision and fewer high-value tool calls** over exhaustive exploration.
-
-- **Runbook ordering** — The user prompt requires checking the runbook_url annotation before deep investigation. Treat that as binding: fetch and apply the runbook before broad discovery.
-- **Anchor on the alert** — Use the alert name, labels (namespace, cluster, service, job, severity), and any text in the notification to choose **narrow** filters. Do not run cluster-wide label enumeration when the alert already identifies a scope.
-- **Tight parallel batches** — Parallel tool calls should share the same incident time window and suspected blast radius (e.g., alert row + metrics for the labeled job + logs for that service). Avoid parallel calls that scatter across unrelated systems without a hypothesis.
-- **Sufficiency** — When metrics or logs support a likely root cause and you can name a single verification step, conclude. Do not continue investigating every datasource for completeness.
-- **Final answer shape** — Lead with a **short verdict** (most likely cause), then evidence (queries, samples), then remediation and follow-up checks.`
-
-const DefaultInvestigationPrompt = `Investigate the alert "{{.AlertName}}" and perform root cause analysis.
-
-**Efficiency:** Treat this alert name and any labels on its rule or firing instance as the primary scope. Prefer **targeted** metrics and logs for the affected service or namespace over unfocused cluster-wide listing. Combine related queries where one PromQL or LogQL answers several checks.
-
-**Your first step:** Find this alert by checking both:
-1. Prometheus datasource alerts (list datasources once to get the Prometheus UID; reuse it)
-2. Grafana-managed alerts
-
-Once you find the alert, check its annotations for a runbook URL (commonly ` + "`runbook_url`" + `). If present, **fetch and read the runbook before** broader metrics/logs/trace exploration. Use the appropriate tool for the URL type (e.g., web_fetch for HTTP, confluence_get_page for Confluence). Follow the runbook's steps; use other tools to fill gaps it leaves open.
-
-Then, scoped to the affected components and time of the incident:
-1. Confirm current alert status and recent state changes
-2. Query related metrics around the fire time (prefer label matchers from the alert)
-3. Search error logs for the affected services (same window and scope)
-4. Use traces only when they add signal for request-level failures or latency (same services)
-
-**Conclude when:** You have a defensible primary hypothesis, supporting evidence, and remediation or escalation steps (aligned with the runbook if one was used).
-
-**Final response:** Start with a brief **verdict**, then evidence, then remediation and one or two verification steps.
-
-Use the available MCP tools for real data and actionable conclusions.`
-
-const DefaultPerformancePrompt = `Analyze performance issues in the system "{{.Target}}".
-
-**Investigation Steps:**
-1. Query key performance metrics (CPU, memory, request latency, error rates)
-2. Identify performance bottlenecks and resource constraints
-3. Search for error logs and warnings related to performance
-4. Check for traces with high latency or failures
-5. Correlate metrics, logs, and traces to identify root causes
-6. Provide optimization recommendations
-
-Use the available MCP tools to gather real data.`
 
 const ToolInstructionsFragment = `{{if .AvailableTools}}
 ## Available MCP Tools

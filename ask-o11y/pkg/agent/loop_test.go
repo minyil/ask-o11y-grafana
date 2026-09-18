@@ -977,6 +977,146 @@ func TestAgentLoop_TruncatedToolCall_LastIterationSurfacesCleanError(t *testing.
 	}
 }
 
+func TestAgentLoop_AccumulatesUsageAndToolCallsIntoDoneEvent(t *testing.T) {
+	// Two LLM calls: one with a tool call, one final text response. Each
+	// carries its own token usage — the done event must report the sum across
+	// both calls, plus a count of the one tool call actually executed.
+	loop, serverURL, cleanup := setupTestLoop(t, []ChatCompletionResponse{
+		{
+			ID: "1",
+			Choices: []Choice{{
+				Message: Message{
+					Role: "assistant",
+					ToolCalls: []ToolCall{{
+						ID:   "tc_1",
+						Type: "function",
+						Function: FunctionCall{
+							Name:      "unknown_tool",
+							Arguments: `{"query": "up"}`,
+						},
+					}},
+				},
+				FinishReason: "tool_calls",
+			}},
+			Usage: &Usage{PromptTokens: 100, CompletionTokens: 20, TotalTokens: 120},
+		},
+		{
+			ID: "2",
+			Choices: []Choice{{
+				Message:      Message{Role: "assistant", Content: "Based on the error..."},
+				FinishReason: "stop",
+			}},
+			Usage: &Usage{PromptTokens: 150, CompletionTokens: 30, TotalTokens: 180},
+		},
+	})
+	defer cleanup()
+
+	eventCh := make(chan SSEEvent, 32)
+	req := LoopRequest{
+		Messages:     []Message{{Role: "user", Content: "query prometheus"}},
+		SystemPrompt: "sys",
+		GrafanaURL:   serverURL,
+		AuthToken:    "test-token",
+		UserRole:     "Admin",
+		OrgID:        "1",
+	}
+
+	go loop.Run(context.Background(), req, eventCh)
+	events := collectEvents(eventCh)
+
+	last := events[len(events)-1]
+	if last.Type != "done" {
+		t.Fatalf("expected last event to be done, got %q", last.Type)
+	}
+	done, ok := last.Data.(DoneEvent)
+	if !ok {
+		t.Fatalf("expected DoneEvent, got %T", last.Data)
+	}
+	if done.PromptTokens != 250 || done.CompletionTokens != 50 || done.TotalTokens != 300 {
+		t.Fatalf("unexpected token totals: %+v", done)
+	}
+	if done.ToolCallCount != 1 {
+		t.Fatalf("expected ToolCallCount 1, got %d", done.ToolCallCount)
+	}
+	if done.TotalIterations != 2 {
+		t.Fatalf("expected TotalIterations 2, got %d", done.TotalIterations)
+	}
+	baseUsage, ok := done.UsageByModel["base"]
+	if !ok {
+		t.Fatalf("expected UsageByModel base entry, got %+v", done.UsageByModel)
+	}
+	if baseUsage.PromptTokens != 250 || baseUsage.CompletionTokens != 50 || baseUsage.TotalTokens != 300 {
+		t.Fatalf("unexpected base usage: %+v", baseUsage)
+	}
+}
+
+func TestAgentLoop_FallbackAttributesUsageToBaseModel(t *testing.T) {
+	var models []string
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+		models = append(models, req.Model)
+		if req.Model == "large" {
+			w.Header().Set("X-Request-Id", "large-req")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"large provider failed"}`)) //nolint:errcheck
+			return
+		}
+		respondAsStream(w, ChatCompletionResponse{
+			ID: "base-ok",
+			Choices: []Choice{{
+				Message:      Message{Role: "assistant", Content: "base recovered"},
+				FinishReason: "stop",
+			}},
+			Usage: &Usage{PromptTokens: 80, CompletionTokens: 20, TotalTokens: 100},
+		})
+	}))
+	defer llmServer.Close()
+
+	llmClient := NewLLMClient(log.DefaultLogger, &http.Client{Timeout: llmTimeout})
+	mcpProxy := mcp.NewProxy(context.Background(), log.DefaultLogger)
+	loop := NewAgentLoop(llmClient, mcpProxy, log.DefaultLogger)
+
+	eventCh := make(chan SSEEvent, 32)
+	req := LoopRequest{
+		Messages:           []Message{{Role: "user", Content: "investigate"}},
+		SystemPrompt:       "sys",
+		Model:              "large",
+		AllowModelFallback: true,
+		GrafanaURL:         llmServer.URL,
+		AuthToken:          "test-token",
+		UserRole:           "Admin",
+		OrgID:              "1",
+	}
+
+	go loop.Run(context.Background(), req, eventCh)
+	events := collectEvents(eventCh)
+
+	last := events[len(events)-1]
+	if last.Type != "done" {
+		t.Fatalf("expected last event to be done, got %q", last.Type)
+	}
+	done, ok := last.Data.(DoneEvent)
+	if !ok {
+		t.Fatalf("expected DoneEvent, got %T", last.Data)
+	}
+	if _, hasLarge := done.UsageByModel["large"]; hasLarge {
+		t.Fatalf("fallback tokens must not be attributed to large, got %+v", done.UsageByModel)
+	}
+	baseUsage, ok := done.UsageByModel["base"]
+	if !ok {
+		t.Fatalf("expected UsageByModel base entry, got %+v", done.UsageByModel)
+	}
+	if baseUsage.PromptTokens != 80 || baseUsage.CompletionTokens != 20 || baseUsage.TotalTokens != 100 {
+		t.Fatalf("unexpected base usage: %+v", baseUsage)
+	}
+	if len(models) < 1 || models[len(models)-1] != "base" {
+		t.Fatalf("expected final LLM call to use base, models = %v", models)
+	}
+}
+
 func TestAgentLoop_ContextCancellation(t *testing.T) {
 	// Slow server — context will be cancelled
 	slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1015,5 +1155,231 @@ func TestAgentLoop_ContextCancellation(t *testing.T) {
 		if e.Type == "done" {
 			t.Error("should not emit done event on cancellation")
 		}
+	}
+}
+
+// TestAgentLoop_EvictsStaleToolResultsAcrossIterations runs enough tool-calling
+// iterations to exceed DefaultKeepRecentToolResults and verifies the LLM requests sent
+// in later iterations no longer carry the full content of the oldest tool
+// results — the manual context-editing pass in the loop (evictStaleToolResults)
+// must actually run each iteration, not just exist as a unit-tested function.
+func TestAgentLoop_EvictsStaleToolResultsAcrossIterations(t *testing.T) {
+	const iterations = DefaultKeepRecentToolResults + 4
+
+	var mu sync.Mutex
+	var requestBodies [][]byte
+	var mainCallCount int
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		requestBodies = append(requestBodies, body)
+		mu.Unlock()
+
+		var parsed ChatCompletionRequest
+		json.Unmarshal(body, &parsed) //nolint:errcheck
+
+		// Eviction summarization calls explicitly request the "base" model —
+		// serve them a plain text summary without consuming a slot in the
+		// main tool-calling iteration sequence below.
+		if parsed.Model == "base" {
+			respondAsStream(w, ChatCompletionResponse{
+				ID:      "summary",
+				Choices: []Choice{{Message: Message{Role: "assistant", Content: "summary"}, FinishReason: "stop"}},
+			})
+			return
+		}
+
+		mu.Lock()
+		mainCallCount++
+		call := mainCallCount
+		mu.Unlock()
+
+		if call > iterations {
+			respondAsStream(w, ChatCompletionResponse{
+				ID:      "final",
+				Choices: []Choice{{Message: Message{Role: "assistant", Content: "done"}, FinishReason: "stop"}},
+			})
+			return
+		}
+		respondAsStream(w, ChatCompletionResponse{
+			ID: fmt.Sprintf("iter-%d", call),
+			Choices: []Choice{{
+				Message: Message{
+					Role: "assistant",
+					ToolCalls: []ToolCall{{
+						ID:   fmt.Sprintf("tc_%d", call),
+						Type: "function",
+						Function: FunctionCall{
+							Name:      "query_loki_logs",
+							Arguments: "{}",
+						},
+					}},
+				},
+				FinishReason: "tool_calls",
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	llmClient := NewLLMClient(log.DefaultLogger, &http.Client{Timeout: llmTimeout})
+	mcpProxy := mcp.NewProxy(context.Background(), log.DefaultLogger)
+	loop := NewAgentLoop(llmClient, mcpProxy, log.DefaultLogger)
+
+	eventCh := make(chan SSEEvent, 256)
+	req := LoopRequest{
+		Messages:      []Message{{Role: "user", Content: "investigate"}},
+		SystemPrompt:  "sys",
+		MaxIterations: iterations + 2,
+		GrafanaURL:    llmServer.URL,
+		AuthToken:     "test-token",
+		UserRole:      "Admin",
+		OrgID:         "1",
+	}
+
+	go loop.Run(context.Background(), req, eventCh)
+	collectEvents(eventCh)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requestBodies) < iterations+1 {
+		t.Fatalf("expected at least %d LLM requests, got %d", iterations+1, len(requestBodies))
+	}
+
+	// The final request (after the last tool call) should carry evicted
+	// placeholders for the oldest tool results, since more tool calls than
+	// DefaultKeepRecentToolResults have accumulated in this run's history.
+	last := requestBodies[len(requestBodies)-1]
+	var lastReq ChatCompletionRequest
+	if err := json.Unmarshal(last, &lastReq); err != nil {
+		t.Fatalf("failed to unmarshal final LLM request: %v", err)
+	}
+
+	var evictedCount, fullCount int
+	for _, m := range lastReq.Messages {
+		if m.Role != "tool" {
+			continue
+		}
+		if strings.HasPrefix(m.Content, EvictedToolResultMarker) {
+			evictedCount++
+		} else {
+			fullCount++
+		}
+	}
+	if evictedCount == 0 {
+		t.Errorf("expected at least one evicted tool result in the final request, got none (fullCount=%d)", fullCount)
+	}
+	if fullCount > DefaultKeepRecentToolResults {
+		t.Errorf("expected at most %d full tool results, got %d", DefaultKeepRecentToolResults, fullCount)
+	}
+}
+
+// TestAgentLoop_CustomKeepRecentToolResults verifies the admin-configurable
+// eviction threshold plumbed via LoopRequest.ContextLimits actually reaches
+// the eviction pass — a low threshold must evict more aggressively than the
+// default, with the loop still completing cleanly.
+func TestAgentLoop_CustomKeepRecentToolResults(t *testing.T) {
+	const keepRecent = 2
+	const iterations = keepRecent + 4
+
+	var mu sync.Mutex
+	var requestBodies [][]byte
+	var mainCallCount int
+
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var parsed ChatCompletionRequest
+		body, _ := io.ReadAll(r.Body)
+		json.Unmarshal(body, &parsed) //nolint:errcheck
+
+		mu.Lock()
+		requestBodies = append(requestBodies, body)
+		mainCallCount++
+		call := mainCallCount
+		mu.Unlock()
+
+		if parsed.Model == "base" {
+			respondAsStream(w, ChatCompletionResponse{
+				ID:      "summary",
+				Choices: []Choice{{Message: Message{Role: "assistant", Content: "summary"}, FinishReason: "stop"}},
+			})
+			return
+		}
+
+		if call > iterations {
+			respondAsStream(w, ChatCompletionResponse{
+				ID:      "final",
+				Choices: []Choice{{Message: Message{Role: "assistant", Content: "done"}, FinishReason: "stop"}},
+			})
+			return
+		}
+		respondAsStream(w, ChatCompletionResponse{
+			ID: fmt.Sprintf("iter-%d", call),
+			Choices: []Choice{{
+				Message: Message{
+					Role: "assistant",
+					ToolCalls: []ToolCall{{
+						ID:   fmt.Sprintf("tc_%d", call),
+						Type: "function",
+						Function: FunctionCall{
+							Name:      "query_loki_logs",
+							Arguments: "{}",
+						},
+					}},
+				},
+				FinishReason: "tool_calls",
+			}},
+		})
+	}))
+	defer llmServer.Close()
+
+	llmClient := NewLLMClient(log.DefaultLogger, &http.Client{Timeout: llmTimeout})
+	mcpProxy := mcp.NewProxy(context.Background(), log.DefaultLogger)
+	loop := NewAgentLoop(llmClient, mcpProxy, log.DefaultLogger)
+
+	eventCh := make(chan SSEEvent, 256)
+	req := LoopRequest{
+		Messages:      []Message{{Role: "user", Content: "investigate"}},
+		SystemPrompt:  "sys",
+		MaxIterations: iterations + 2,
+		ContextLimits: ContextLimits{KeepRecentToolResults: keepRecent},
+		GrafanaURL:    llmServer.URL,
+		AuthToken:     "test-token",
+		UserRole:      "Admin",
+		OrgID:         "1",
+	}
+
+	go loop.Run(context.Background(), req, eventCh)
+	collectEvents(eventCh)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if mainCallCount < iterations+1 {
+		t.Fatalf("expected at least %d main LLM calls, got %d", iterations+1, mainCallCount)
+	}
+
+	// The final request must honor the custom threshold: at most keepRecent
+	// full tool results, the rest evicted to placeholders.
+	last := requestBodies[len(requestBodies)-1]
+	var lastReq ChatCompletionRequest
+	if err := json.Unmarshal(last, &lastReq); err != nil {
+		t.Fatalf("failed to unmarshal final LLM request: %v", err)
+	}
+
+	var evictedCount, fullCount int
+	for _, m := range lastReq.Messages {
+		if m.Role != "tool" {
+			continue
+		}
+		if strings.HasPrefix(m.Content, EvictedToolResultMarker) {
+			evictedCount++
+		} else {
+			fullCount++
+		}
+	}
+	if evictedCount == 0 {
+		t.Errorf("expected evicted tool results with keepRecent=%d, got none (fullCount=%d)", keepRecent, fullCount)
+	}
+	if fullCount > keepRecent {
+		t.Errorf("expected at most %d full tool results with custom ContextLimits, got %d", keepRecent, fullCount)
 	}
 }

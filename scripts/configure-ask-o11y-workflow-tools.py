@@ -71,6 +71,9 @@ def tool_selections(spec: dict[str, Any]) -> dict[str, bool]:
     return selections
 
 
+TOOL_CALL_TIMEOUT_SECONDS = 3600
+
+
 def build_servers(use_local_defaults: bool) -> list[dict[str, Any]]:
     return [
         {
@@ -80,6 +83,8 @@ def build_servers(use_local_defaults: bool) -> list[dict[str, Any]]:
             "type": "streamable-http",
             "enabled": True,
             "trusted": True,
+            # Long Python analyses: upstream defaults each tool call to 30s.
+            "timeoutSeconds": TOOL_CALL_TIMEOUT_SECONDS,
             "headers": {"Authorization": "", "X-Grafana-Org-Id": "", "X-Grafana-User": ""},
             "toolSelections": tool_selections(spec),
         }

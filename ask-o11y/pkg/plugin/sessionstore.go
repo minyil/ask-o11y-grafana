@@ -11,10 +11,11 @@ import (
 )
 
 type SessionMessage struct {
-	Role      string          `json:"role"`
-	Content   string          `json:"content"`
-	ToolCalls json.RawMessage `json:"toolCalls,omitempty"`
-	PageRefs  json.RawMessage `json:"pageRefs,omitempty"`
+	Role       string          `json:"role"`
+	Content    string          `json:"content"`
+	ToolCalls  json.RawMessage `json:"toolCalls,omitempty"`
+	PageRefs   json.RawMessage `json:"pageRefs,omitempty"`
+	TokenUsage json.RawMessage `json:"tokenUsage,omitempty"`
 }
 
 type ChatSession struct {
@@ -30,6 +31,28 @@ type ChatSession struct {
 	UploadDatasetID string           `json:"uploadDatasetId,omitempty"`
 	UserID          int64            `json:"-"`
 	OrgID           int64            `json:"-"`
+
+	// Usage stats, accumulated from each completed agent run's DoneEvent.
+	// Runs are TTL'd out of Redis after RunMaxAge, so these must be
+	// incremented on-write (see IncrementStats) rather than computed by
+	// summing historical runs.
+	RunCount         int   `json:"runCount"`
+	TotalIterations  int   `json:"totalIterations"`
+	ToolCallCount    int   `json:"toolCallCount"`
+	PromptTokens     int64 `json:"promptTokens"`
+	CompletionTokens int64 `json:"completionTokens"`
+	TotalTokens      int64 `json:"totalTokens"`
+}
+
+// SessionStatsDelta carries the per-run increments applied to a session's
+// cumulative usage stats when an agent run finishes.
+type SessionStatsDelta struct {
+	RunCount         int
+	TotalIterations  int
+	ToolCallCount    int
+	PromptTokens     int64
+	CompletionTokens int64
+	TotalTokens      int64
 }
 
 type SessionMetadata struct {
@@ -62,7 +85,12 @@ type SessionStoreInterface interface {
 	ClearCurrentSessionID(userID, orgID int64) error
 	SetActiveRunID(sessionID string, userID, orgID int64, runID string) error
 	ClearActiveRunID(sessionID string, userID, orgID int64) error
+	IncrementStats(sessionID string, userID, orgID int64, delta SessionStatsDelta) error
 	SetUploadDatasetID(sessionID string, userID, orgID int64, datasetID string) error
+	// CleanupOld removes sessions past the store's configured retention
+	// window. Redis-backed stores expire sessions natively (see
+	// NewRedisSessionStore) and implement this as a no-op.
+	CleanupOld()
 }
 
 func sessionOwnerKey(userID, orgID int64) string {
@@ -83,19 +111,21 @@ func generateSessionTitle(messages []SessionMessage) string {
 }
 
 type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]*ChatSession        // sessionID -> session
-	userIdx  map[string]map[string]struct{} // ownerKey -> set of sessionIDs
-	current  map[string]string              // ownerKey -> current sessionID
-	logger   log.Logger
+	mu         sync.RWMutex
+	sessions   map[string]*ChatSession        // sessionID -> session
+	userIdx    map[string]map[string]struct{} // ownerKey -> set of sessionIDs
+	current    map[string]string              // ownerKey -> current sessionID
+	logger     log.Logger
+	sessionTTL time.Duration
 }
 
-func NewSessionStore(logger log.Logger) *SessionStore {
+func NewSessionStore(logger log.Logger, sessionTTL time.Duration) *SessionStore {
 	return &SessionStore{
-		sessions: make(map[string]*ChatSession),
-		userIdx:  make(map[string]map[string]struct{}),
-		current:  make(map[string]string),
-		logger:   logger,
+		sessions:   make(map[string]*ChatSession),
+		userIdx:    make(map[string]map[string]struct{}),
+		current:    make(map[string]string),
+		logger:     logger,
+		sessionTTL: sessionTTL,
 	}
 }
 
@@ -104,10 +134,6 @@ func (s *SessionStore) CreateSession(userID, orgID int64, title string, messages
 	defer s.mu.Unlock()
 
 	ownerKey := sessionOwnerKey(userID, orgID)
-
-	if idx, ok := s.userIdx[ownerKey]; ok && len(idx) >= SessionMaxPerUserOrg {
-		s.evictOldest(ownerKey)
-	}
 
 	id, err := generateShareID()
 	if err != nil {
@@ -138,32 +164,6 @@ func (s *SessionStore) CreateSession(userID, orgID int64, title string, messages
 	s.userIdx[ownerKey][id] = struct{}{}
 
 	return session, nil
-}
-
-func (s *SessionStore) evictOldest(ownerKey string) {
-	idx := s.userIdx[ownerKey]
-	if len(idx) == 0 {
-		return
-	}
-
-	var oldest *ChatSession
-	for id := range idx {
-		sess := s.sessions[id]
-		if sess == nil {
-			continue
-		}
-		if oldest == nil || sess.UpdatedAt.Before(oldest.UpdatedAt) {
-			oldest = sess
-		}
-	}
-
-	if oldest != nil {
-		delete(s.sessions, oldest.ID)
-		delete(idx, oldest.ID)
-		if s.current[ownerKey] == oldest.ID {
-			delete(s.current, ownerKey)
-		}
-	}
 }
 
 func (s *SessionStore) GetSession(sessionID string, userID, orgID int64) (*ChatSession, error) {
@@ -384,6 +384,49 @@ func (s *SessionStore) ClearActiveRunID(sessionID string, userID, orgID int64) e
 	return nil
 }
 
+func (s *SessionStore) IncrementStats(sessionID string, userID, orgID int64, delta SessionStatsDelta) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, exists := s.sessions[sessionID]
+	if !exists {
+		return fmt.Errorf("session not found")
+	}
+	if session.UserID != userID || session.OrgID != orgID {
+		return fmt.Errorf("session not found")
+	}
+
+	session.RunCount += delta.RunCount
+	session.TotalIterations += delta.TotalIterations
+	session.ToolCallCount += delta.ToolCallCount
+	session.PromptTokens += delta.PromptTokens
+	session.CompletionTokens += delta.CompletionTokens
+	session.TotalTokens += delta.TotalTokens
+	session.UpdatedAt = time.Now()
+
+	return nil
+}
+
 func (s *SessionStore) CleanupOld() {
-	// In-memory store doesn't need periodic cleanup — sessions are persistent.
+	if s.sessionTTL <= 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := time.Now().Add(-s.sessionTTL)
+	for id, sess := range s.sessions {
+		if sess.UpdatedAt.After(cutoff) {
+			continue
+		}
+		ownerKey := sessionOwnerKey(sess.UserID, sess.OrgID)
+		delete(s.sessions, id)
+		if idx, ok := s.userIdx[ownerKey]; ok {
+			delete(idx, id)
+		}
+		if s.current[ownerKey] == id {
+			delete(s.current, ownerKey)
+		}
+	}
 }

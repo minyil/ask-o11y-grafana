@@ -1,6 +1,7 @@
 import { config } from '@grafana/runtime';
+import { pluginUrl } from '../utils/subpath';
 
-const UPLOAD_URL = '/api/plugins/consensys-asko11y-app/resources/api/uploads';
+const UPLOAD_URL = pluginUrl('/api/uploads');
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
 function orgHeaders(): Record<string, string> {

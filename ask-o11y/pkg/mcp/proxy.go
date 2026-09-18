@@ -20,14 +20,32 @@ type Proxy struct {
 	mu            sync.RWMutex
 	healthMonitor *HealthMonitor
 	ctx           context.Context
+	// perUserToken, when set, is passed to every Client so OAuth-enabled
+	// servers can inject a per-user bearer on outbound MCP requests.
+	perUserToken PerUserTokenProvider
+	// resultCache holds short-lived results for the slow, read-only tool
+	// calls named in cacheableToolTTL — see result_cache.go.
+	resultCache *resultCache
+}
+
+// SetPerUserTokenProvider registers the provider for per-user OAuth tokens
+// and propagates it to every existing and future MCP client.
+func (p *Proxy) SetPerUserTokenProvider(provider PerUserTokenProvider) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.perUserToken = provider
+	for _, c := range p.clients {
+		c.SetPerUserTokenProvider(provider)
+	}
 }
 
 // NewProxy creates a new MCP proxy
 func NewProxy(ctx context.Context, logger log.Logger) *Proxy {
 	p := &Proxy{
-		clients: make(map[string]*Client),
-		logger:  logger,
-		ctx:     ctx,
+		clients:     make(map[string]*Client),
+		logger:      logger,
+		ctx:         ctx,
+		resultCache: newResultCache(),
 	}
 	p.healthMonitor = NewHealthMonitor(p, logger)
 	return p
@@ -76,7 +94,11 @@ func (p *Proxy) UpdateConfig(configs []ServerConfig) error {
 	}
 	for id, config := range newConfigs {
 		if _, exists := p.clients[id]; !exists {
-			p.clients[id] = NewClient(p.ctx, config, p.logger, sdkHTTPClient)
+			c := NewClient(p.ctx, config, p.logger, sdkHTTPClient)
+			if p.perUserToken != nil {
+				c.SetPerUserTokenProvider(p.perUserToken)
+			}
+			p.clients[id] = c
 			p.logger.Info("Added MCP client", "id", id, "url", config.URL, "type", config.Type)
 		}
 	}
@@ -92,6 +114,13 @@ func (p *Proxy) UpdateConfig(configs []ServerConfig) error {
 
 // ListTools aggregates tools from all configured MCP servers
 func (p *Proxy) ListTools() ([]Tool, error) {
+	return p.ListToolsWithContext(context.Background())
+}
+
+// ListToolsWithContext aggregates tools from all servers, forwarding the
+// caller's context so OAuth-enabled servers can authenticate discovery as
+// the current user (mcp.WithUserID).
+func (p *Proxy) ListToolsWithContext(ctx context.Context) ([]Tool, error) {
 	p.mu.RLock()
 	clients := make([]*Client, 0, len(p.clients))
 	for _, client := range p.clients {
@@ -112,7 +141,7 @@ func (p *Proxy) ListTools() ([]Tool, error) {
 	results := make(chan result, len(clients))
 	for _, client := range clients {
 		go func(c *Client) {
-			tools, err := c.ListTools()
+			tools, err := c.ListToolsWithContext(ctx)
 			results <- result{tools: tools, err: err}
 		}(client)
 	}
@@ -142,19 +171,40 @@ func (p *Proxy) ListTools() ([]Tool, error) {
 
 // CallTool routes a tool call to the appropriate MCP server
 func (p *Proxy) CallTool(toolName string, arguments map[string]interface{}) (*CallToolResult, error) {
-	return p.CallToolWithContext(toolName, arguments, "", "", "")
+	return p.CallToolWithContext(context.Background(), toolName, arguments, "", "", "")
 }
 
-// CallToolWithContext routes a tool call to the appropriate MCP server with additional context (e.g., Org ID, Org Name, Scope Org ID)
-func (p *Proxy) CallToolWithContext(toolName string, arguments map[string]interface{}, orgID string, orgName string, scopeOrgId string) (*CallToolResult, error) {
-	return p.CallToolWithActorContext(toolName, arguments, orgID, orgName, scopeOrgId, "")
+// NewStandaloneClient returns a fresh Client for the named server, entirely
+// independent of the shared pool's session state. Client.CallToolWithContext
+// with a non-empty org context ALWAYS tears down and replaces the shared
+// session (connectMCPWithOrgContext) on every call, by design, so a
+// long-running or backgrounded caller sharing the pooled Client with a live
+// request risks closing the session out from under that request's in-flight
+// tool call. Use a standalone client for exactly that case — background
+// prefetch/cache-warming that must not race with concurrent foreground
+// traffic on the same server. Callers must Close() the returned client.
+func (p *Proxy) NewStandaloneClient(id string) (*Client, bool) {
+	p.mu.RLock()
+	existing, ok := p.clients[id]
+	p.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+
+	sdkHTTPClient, err := p.sdkClient()
+	if err != nil {
+		return nil, false
+	}
+	c := NewClient(p.ctx, existing.config, p.logger, sdkHTTPClient)
+	if p.perUserToken != nil {
+		c.SetPerUserTokenProvider(p.perUserToken)
+	}
+	return c, true
 }
 
-func (p *Proxy) CallToolWithActorContext(toolName string, arguments map[string]interface{}, orgID string, orgName string, scopeOrgId string, actorUserID string) (*CallToolResult, error) {
-	return p.CallToolForRequest(p.ctx, toolName, arguments, orgID, orgName, scopeOrgId, actorUserID)
-}
-
-func (p *Proxy) CallToolForRequest(ctx context.Context, toolName string, arguments map[string]interface{}, orgID string, orgName string, scopeOrgId string, actorUserID string) (*CallToolResult, error) {
+// CallToolWithContext routes a tool call to the appropriate MCP server with additional context (e.g., Org ID, Org Name, Scope Org ID).
+// ctx carries the Grafana user ID (via mcp.WithUserID) for servers using per-user OAuth.
+func (p *Proxy) CallToolWithContext(ctx context.Context, toolName string, arguments map[string]interface{}, orgID string, orgName string, scopeOrgId string) (*CallToolResult, error) {
 	// Extract server ID from tool name prefix
 	parts := strings.SplitN(toolName, "_", 2)
 	if len(parts) < 2 {
@@ -181,7 +231,23 @@ func (p *Proxy) CallToolForRequest(ctx context.Context, toolName string, argumen
 
 	p.logger.Debug("Calling tool on MCP server", "tool", toolName, "server", serverID, "orgID", orgID, "orgName", orgName, "scopeOrgId", scopeOrgId)
 
-	return client.CallToolForRequest(ctx, toolName, arguments, orgID, orgName, scopeOrgId, actorUserID)
+	ttl, cacheable := cacheableTTL(toolName)
+	if !cacheable {
+		return client.CallToolWithContext(ctx, toolName, arguments, orgID, orgName, scopeOrgId)
+	}
+
+	userID, _ := UserIDFromContext(ctx)
+	key := cacheKey(toolName, orgID, scopeOrgId, userID, arguments)
+	if cached, hit := p.resultCache.get(key); hit {
+		p.logger.Debug("Serving cached MCP tool result", "tool", toolName, "server", serverID)
+		return cached, nil
+	}
+
+	result, err := client.CallToolWithContext(ctx, toolName, arguments, orgID, orgName, scopeOrgId)
+	if err == nil && result != nil && !result.IsError {
+		p.resultCache.set(key, result, ttl)
+	}
+	return result, err
 }
 
 // HandleMCPRequest handles an MCP JSON-RPC request
@@ -330,7 +396,11 @@ func (p *Proxy) EnsureServer(config ServerConfig) error {
 		p.logger.Debug("Replacing MCP client", "id", config.ID)
 	}
 
-	p.clients[config.ID] = NewClient(p.ctx, config, p.logger, sdkHTTPClient)
+	c := NewClient(p.ctx, config, p.logger, sdkHTTPClient)
+	if p.perUserToken != nil {
+		c.SetPerUserTokenProvider(p.perUserToken)
+	}
+	p.clients[config.ID] = c
 	p.mu.Unlock()
 
 	if replaced != nil {
@@ -362,7 +432,7 @@ func (p *Proxy) RemoveServer(id string) {
 func (p *Proxy) sdkClient() (*http.Client, error) {
 	return httpclient.New(httpclient.Options{
 		Timeouts: &httpclient.TimeoutOptions{
-			Timeout:     toolCallTimeout,
+			Timeout:     30 * time.Second,
 			DialTimeout: connectDialTimeout,
 		},
 	})

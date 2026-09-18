@@ -491,6 +491,13 @@
                           "type": "integer"
                         }
                       }
+                    },
+                    "oauth": {
+                      "type": "object",
+                      "description": "Per-user OAuth connection state keyed by server ID; present only for servers configured with an oauth block.",
+                      "additionalProperties": {
+                        "$ref": "#/components/schemas/OAuthStatus"
+                      }
                     }
                   }
                 }
@@ -1479,6 +1486,55 @@
         }
       }
     },
+    "/api/sessions/{sessionId}/stats": {
+      "get": {
+        "summary": "Get session usage stats",
+        "description": "Returns cumulative usage stats (tokens, turns, tool calls) for a session, accumulated across all its agent runs. Only the session owner (same user + org) can access it. Omits the full message history \u2014 use GET /api/sessions/{sessionId} for the full transcript.",
+        "operationId": "getSessionStats",
+        "tags": [
+          "Sessions"
+        ],
+        "parameters": [
+          {
+            "name": "sessionId",
+            "in": "path",
+            "required": true,
+            "description": "Session ID (base64 URL-safe 32-byte token)",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/X-Grafana-Org-Id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session usage stats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionStats"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
     "/api/sessions/share": {
       "post": {
         "summary": "Create share link",
@@ -1854,6 +1910,442 @@
           }
         }
       }
+    },
+    "/api/oauth/{serverId}/start": {
+      "get": {
+        "summary": "Start per-user OAuth flow",
+        "description": "Begins the OAuth 2.0 authorization-code flow (with PKCE when configured) for the current Grafana user against an OAuth-enabled MCP server. Responds with a 302 redirect to the provider's authorization endpoint. Intended to be opened in a popup window.",
+        "operationId": "startMCPOAuth",
+        "tags": [
+          "OAuth"
+        ],
+        "parameters": [
+          {
+            "name": "serverId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "MCP server ID"
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to the provider's authorization endpoint"
+          },
+          "401": {
+            "description": "No authenticated Grafana user"
+          },
+          "404": {
+            "description": "Server unknown or has no OAuth configuration"
+          }
+        }
+      }
+    },
+    "/api/oauth/{serverId}/callback": {
+      "get": {
+        "summary": "OAuth authorization-code callback",
+        "description": "Redirect target registered with the authorization server. Validates the one-shot state, exchanges the code for tokens, persists them for the initiating user, and returns a small HTML page that notifies the opener window via postMessage and closes itself.",
+        "operationId": "mcpOAuthCallback",
+        "tags": [
+          "OAuth"
+        ],
+        "parameters": [
+          {
+            "name": "serverId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "MCP server ID"
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Authorization code issued by the provider"
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque one-shot state issued at /start"
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider error code when the grant was denied"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "HTML page reporting the outcome to the opener window",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/oauth/{serverId}/status": {
+      "get": {
+        "summary": "Per-user OAuth connection status",
+        "description": "Reports whether the current Grafana user has connected their account for an OAuth-enabled MCP server.",
+        "operationId": "getMCPOAuthStatus",
+        "tags": [
+          "OAuth"
+        ],
+        "parameters": [
+          {
+            "name": "serverId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "MCP server ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Connection status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OAuthStatus"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Server unknown or has no OAuth configuration"
+          }
+        }
+      }
+    },
+    "/api/oauth/{serverId}/disconnect": {
+      "post": {
+        "summary": "Disconnect per-user OAuth",
+        "description": "Deletes the current Grafana user's stored token for an OAuth-enabled MCP server.",
+        "operationId": "disconnectMCPOAuth",
+        "tags": [
+          "OAuth"
+        ],
+        "parameters": [
+          {
+            "name": "serverId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "MCP server ID"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Token deleted"
+          },
+          "401": {
+            "description": "No authenticated Grafana user"
+          },
+          "404": {
+            "description": "Server unknown or has no OAuth configuration"
+          }
+        }
+      }
+    },
+    "/api/mcp/provisioner/presets": {
+      "get": {
+        "summary": "List MCP provider presets",
+        "description": "Returns the built-in catalog of one-click external MCP providers (GitHub read-only, GitHub read/write, Atlassian) so the admin UI can render preset cards.",
+        "operationId": "listMCPPresets",
+        "tags": [
+          "MCP Provisioner"
+        ],
+        "responses": {
+          "200": {
+            "description": "Preset catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "presets": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MCPPreset"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mcp/provisioner": {
+      "get": {
+        "summary": "List dynamically provisioned MCP servers",
+        "description": "Returns MCP servers added at runtime through the admin UI. OAuth client credentials are never included in responses.",
+        "operationId": "listDynamicMCPServers",
+        "tags": [
+          "MCP Provisioner"
+        ],
+        "responses": {
+          "200": {
+            "description": "Provisioned servers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "servers": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/DynamicMCPServer"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mcp/provisioner/preset": {
+      "post": {
+        "summary": "Provision an MCP server from a preset",
+        "description": "Admin-only. Attaches a preset external MCP server. For DCR-capable providers (Atlassian) OAuth endpoints are discovered via RFC 8414/9728 and a client is registered via RFC 7591 automatically; for others (GitHub) the admin supplies clientId and optionally clientSecret.",
+        "operationId": "addMCPPreset",
+        "tags": [
+          "MCP Provisioner"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "preset"
+                ],
+                "properties": {
+                  "preset": {
+                    "type": "string",
+                    "enum": [
+                      "github-read",
+                      "github-write",
+                      "atlassian"
+                    ]
+                  },
+                  "clientId": {
+                    "type": "string",
+                    "description": "OAuth client ID; required for presets without dynamic client registration"
+                  },
+                  "clientSecret": {
+                    "type": "string",
+                    "description": "Optional OAuth client secret (PKCE preferred)"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Server provisioned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "serverId": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown preset or missing clientId"
+          },
+          "403": {
+            "description": "Caller is not a Grafana Admin"
+          },
+          "502": {
+            "description": "OAuth discovery or dynamic client registration against the provider failed"
+          }
+        }
+      }
+    },
+    "/api/mcp/provisioner/generic": {
+      "post": {
+        "summary": "Provision a generic OAuth-gated MCP server",
+        "description": "Admin-only. Attaches any MCP server that authenticates users via OAuth 2.0 authorization-code. With discover=true the OAuth endpoints (and client registration when clientId is empty) are resolved automatically from the server's advertised metadata.",
+        "operationId": "addGenericMCP",
+        "tags": [
+          "MCP Provisioner"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "serverId",
+                  "mcpUrl",
+                  "transport"
+                ],
+                "properties": {
+                  "serverId": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9-]{1,64}$"
+                  },
+                  "displayName": {
+                    "type": "string"
+                  },
+                  "mcpUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "transport": {
+                    "type": "string",
+                    "enum": [
+                      "streamable-http",
+                      "sse"
+                    ]
+                  },
+                  "authorizationUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "tokenUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "clientId": {
+                    "type": "string"
+                  },
+                  "clientSecret": {
+                    "type": "string"
+                  },
+                  "scopes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "pkce": {
+                    "type": "boolean"
+                  },
+                  "discover": {
+                    "type": "boolean",
+                    "description": "Resolve OAuth endpoints (and register a client when clientId is empty) from the server's advertised metadata"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Server provisioned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "serverId": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or invalid fields"
+          },
+          "403": {
+            "description": "Caller is not a Grafana Admin"
+          },
+          "502": {
+            "description": "OAuth discovery or dynamic client registration against the provider failed"
+          }
+        }
+      }
+    },
+    "/api/mcp/provisioner/{serverId}": {
+      "delete": {
+        "summary": "Remove a dynamically provisioned MCP server",
+        "description": "Admin-only. Detaches the server from the MCP proxy and deletes its persisted record and OAuth configuration.",
+        "operationId": "removeDynamicMCPServer",
+        "tags": [
+          "MCP Provisioner"
+        ],
+        "parameters": [
+          {
+            "name": "serverId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "MCP server ID"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Server removed"
+          },
+          "403": {
+            "description": "Caller is not a Grafana Admin"
+          }
+        }
+      }
+    },
+    "/api/skills": {
+      "get": {
+        "summary": "List agent skills",
+        "description": "Returns metadata for skills without their bodies, feeding the chat slash commands and the AppConfig Skills tab. Hidden skills are excluded from this listing \u2014 they are never offered to users or the model. Admins may pass ?include=content to receive every skill (hidden included) with its SKILL.md source for the editor. Skill content is authored through the Grafana plugin admin API (jsonData.skills.entries), not through this endpoint.",
+        "operationId": "listSkills",
+        "tags": [
+          "Configuration"
+        ],
+        "responses": {
+          "200": {
+            "description": "Skill listing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillListResponse"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Method not allowed (only GET is supported)"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2187,8 +2679,10 @@
       },
       "RunRequest": {
         "type": "object",
-        "description": "Request to start an agent run. The backend builds the system prompt and manages context window based on the message type and server-side session history.",
-        "required": ["message"],
+        "description": "Request to start an agent run. The backend resolves skills (explicit selection, legacy type mapping, or message triggers), builds the system prompt, and manages the context window based on server-side session history.",
+        "required": [
+          "message"
+        ],
         "properties": {
           "message": {
             "type": "string",
@@ -2198,6 +2692,13 @@
             "type": "string",
             "enum": ["investigation", "performance", "chat"],
             "description": "Message type that determines which server-side prompt template to use"
+          },
+          "skills": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Skill names to explicitly activate for this run (optional). Unknown, disabled, or hidden names return 400."
           },
           "sessionId": {
             "type": "string",
@@ -2292,9 +2793,19 @@
           },
           "sessionId": {
             "type": "string"
+          },
+          "skills": {
+            "type": "array",
+            "description": "Skills active for this run",
+            "items": {
+              "$ref": "#/components/schemas/RunStartedSkill"
+            }
           }
         },
-        "required": ["runId"]
+        "required": [
+          "runId"
+        ],
+        "description": "Emitted as the first event of a run when a run ID is set, carrying the active skill metadata for the UI."
       },
       "ContentEvent": {
         "type": "object",
@@ -2900,6 +3411,33 @@
             "type": "string",
             "enum": ["base", "large"],
             "description": "LLM app model abstraction locked to this session, if selected"
+          },
+          "runCount": {
+            "type": "integer",
+            "description": "Number of completed agent runs (turns) in this session"
+          },
+          "totalIterations": {
+            "type": "integer",
+            "description": "Sum of agent-loop iterations (LLM round-trips) across all runs"
+          },
+          "toolCallCount": {
+            "type": "integer",
+            "description": "Sum of tool calls executed across all runs"
+          },
+          "promptTokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of LLM prompt tokens across all runs"
+          },
+          "completionTokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of LLM completion tokens across all runs"
+          },
+          "totalTokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of LLM prompt + completion tokens across all runs"
           }
         },
         "required": ["id", "title", "messages", "createdAt", "updatedAt", "messageCount"]
@@ -2938,7 +3476,253 @@
             "description": "LLM app model abstraction locked to this session, if selected"
           }
         },
-        "required": ["id", "title", "createdAt", "updatedAt", "messageCount"]
+        "required": [
+          "id",
+          "title",
+          "createdAt",
+          "updatedAt",
+          "messageCount"
+        ]
+      },
+      "SessionStats": {
+        "type": "object",
+        "description": "Cumulative usage stats for a session, accumulated across all its agent runs",
+        "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "Session ID (base64 URL-safe 32-byte token)"
+          },
+          "runCount": {
+            "type": "integer",
+            "description": "Number of completed agent runs (turns) in this session"
+          },
+          "totalIterations": {
+            "type": "integer",
+            "description": "Sum of agent-loop iterations (LLM round-trips) across all runs"
+          },
+          "toolCallCount": {
+            "type": "integer",
+            "description": "Sum of tool calls executed across all runs"
+          },
+          "promptTokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of LLM prompt tokens across all runs"
+          },
+          "completionTokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of LLM completion tokens across all runs"
+          },
+          "totalTokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sum of LLM prompt + completion tokens across all runs"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "sessionId",
+          "runCount",
+          "totalIterations",
+          "toolCallCount",
+          "promptTokens",
+          "completionTokens",
+          "totalTokens",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "OAuthStatus": {
+        "type": "object",
+        "description": "Per-user OAuth connection state for an MCP server",
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "description": "The server has an OAuth block"
+          },
+          "connected": {
+            "type": "boolean",
+            "description": "The current user holds a usable token"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "MCPPreset": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "github-read",
+              "github-write",
+              "atlassian"
+            ]
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "serverId": {
+            "type": "string"
+          },
+          "mcpUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "transport": {
+            "type": "string",
+            "enum": [
+              "streamable-http",
+              "sse"
+            ]
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "dcrCapable": {
+            "type": "boolean",
+            "description": "Provider supports RFC 7591 dynamic client registration"
+          }
+        }
+      },
+      "DynamicMCPServer": {
+        "type": "object",
+        "properties": {
+          "serverId": {
+            "type": "string"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "mcpUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "transport": {
+            "type": "string"
+          },
+          "presetId": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "RunStartedSkill": {
+        "type": "object",
+        "description": "A skill active for an agent run",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description"
+        ]
+      },
+      "SkillInfo": {
+        "type": "object",
+        "description": "Skill metadata. Bodies are excluded; this listing is safe for all roles.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "bundled",
+              "custom"
+            ],
+            "description": "bundled skills ship in the plugin binary; custom skills are admin-authored"
+          },
+          "customized": {
+            "type": "boolean",
+            "description": "A bundled skill whose SKILL.md was overridden by an admin entry"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "hidden": {
+            "type": "boolean",
+            "description": "Hidden skills are excluded from non-admin listings and never offered to users or the model; visible only in the Admin ?include=content management listing"
+          },
+          "model": {
+            "type": "string",
+            "enum": [
+              "base",
+              "large"
+            ],
+            "description": "Model preference when this skill is active"
+          },
+          "maxIterations": {
+            "type": "integer",
+            "description": "Iteration budget when this skill is active"
+          },
+          "triggers": {
+            "type": "string",
+            "description": "Case-insensitive regex that auto-activates the skill on match"
+          },
+          "version": {
+            "type": "string"
+          },
+          "hasUserPrompt": {
+            "type": "boolean"
+          },
+          "invalid": {
+            "type": "boolean",
+            "description": "The admin entry failed validation and is not active"
+          },
+          "invalidReason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "source",
+          "customized",
+          "enabled",
+          "hidden",
+          "hasUserPrompt"
+        ]
+      },
+      "SkillListResponse": {
+        "type": "object",
+        "properties": {
+          "skills": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SkillInfo"
+            }
+          }
+        },
+        "required": [
+          "skills"
+        ]
       }
     }
   }

@@ -34,12 +34,36 @@ const (
 	RunMaxAge                 = 1 * time.Hour
 	RunCleanupInterval        = 5 * time.Minute
 	RunMaxEventsPerRun        = 500
+	RunHeartbeatInterval      = 30 * time.Second
+	RunHeartbeatTTL           = 90 * time.Second
 )
 
 const (
-	SessionMaxPerUserOrg = 50
+	RunStreamStatusCheckInterval = 30 * time.Second
 )
 
 const (
 	GraphitiDiscoveryMaxIter = 50
+	// GraphitiRetentionInterval paces Scout.RunRetention (community build +
+	// episode prune), independent of GraphitiScanInterval so retention still
+	// runs when discovery auto-scan is off.
+	GraphitiRetentionInterval = 1 * time.Hour
 )
+
+// Retention defaults, used when the corresponding PluginSettings field is
+// unset (0). Both are user-configurable per org since auto-saving every
+// session to the knowledge graph (see autoSaveSessionToGraphiti) makes both
+// stores grow much faster than when ingestion was an opt-in button click.
+const (
+	DefaultSessionTTLDays         = 90
+	DefaultGraphitiEpisodeTTLDays = 30
+)
+
+// resolveTTLDays converts a user-configured retention window (in days, 0
+// meaning "use the default") into a duration.
+func resolveTTLDays(days, defaultDays int) time.Duration {
+	if days <= 0 {
+		days = defaultDays
+	}
+	return time.Duration(days) * 24 * time.Hour
+}

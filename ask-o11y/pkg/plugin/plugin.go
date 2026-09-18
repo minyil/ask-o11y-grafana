@@ -3,8 +3,10 @@ package plugin
 import (
 	"consensys-asko11y-app/pkg/agent"
 	"consensys-asko11y-app/pkg/mcp"
+	"consensys-asko11y-app/pkg/plugin/oauth"
 	"consensys-asko11y-app/pkg/plugin/openapi"
 	"consensys-asko11y-app/pkg/rbac"
+	"consensys-asko11y-app/pkg/skills"
 	"context"
 	"encoding/json"
 	"errors"
@@ -95,6 +97,10 @@ type PluginSettings struct {
 	InvestigationPrompt string `json:"investigationPrompt,omitempty"`
 	PerformancePrompt   string `json:"performancePrompt,omitempty"`
 
+	// Skills holds admin-managed entries from the AppConfig Skills tab:
+	// overrides of bundled skills and fully custom skills.
+	Skills skills.Settings `json:"skills,omitempty"`
+
 	MaxTotalTokens     int `json:"maxTotalTokens,omitempty"`
 	RecentMessageCount int `json:"recentMessageCount,omitempty"`
 
@@ -109,9 +115,30 @@ type PluginSettings struct {
 	ServiceGraphMaxNodes int    `json:"serviceGraphMaxNodes,omitempty"`
 	ServiceGraphMaxEdges int    `json:"serviceGraphMaxEdges,omitempty"`
 
+	// GraphitiAutoSaveSessionsDisabled turns off the default behavior of
+	// feeding every completed session into the knowledge graph. Named as a
+	// "disabled" flag (rather than an "enabled" one defaulting true) so the
+	// Go zero value keeps auto-save on for existing installs that predate
+	// this setting.
+	GraphitiAutoSaveSessionsDisabled bool `json:"graphitiAutoSaveSessionsDisabled,omitempty"`
+	// SessionTTLDays and GraphitiEpisodeTTLDays are retention windows in
+	// days; 0 (unset) falls back to DefaultSessionTTLDays /
+	// DefaultGraphitiEpisodeTTLDays.
+	SessionTTLDays         int `json:"sessionTTLDays,omitempty"`
+	GraphitiEpisodeTTLDays int `json:"graphitiEpisodeTTLDays,omitempty"`
+
 	ApprovalPolicy          string `json:"approvalPolicy,omitempty"`
 	MaxParallelToolCalls    int    `json:"maxParallelToolCalls,omitempty"`
 	AgentEvalCaptureEnabled bool   `json:"agentEvalCaptureEnabled,omitempty"`
+
+	// Context-window management knobs, mapped onto agent.ContextLimits. Zero
+	// values resolve to the defaults inside the agent loop.
+	KeepRecentToolResults                  int  `json:"keepRecentToolResults,omitempty"`
+	MaxToolResponseTokens                  int  `json:"maxToolResponseTokens,omitempty"`
+	AggressiveToolResponseTokens           int  `json:"aggressiveToolResponseTokens,omitempty"`
+	MaxHighVolumeToolResponseTokens        int  `json:"maxHighVolumeToolResponseTokens,omitempty"`
+	AggressiveHighVolumeToolResponseTokens int  `json:"aggressiveHighVolumeToolResponseTokens,omitempty"`
+	ToolCallSummarizationDisabled          bool `json:"toolCallSummarizationDisabled,omitempty"`
 }
 
 const mcpServerHeaderPrefix = "mcpServerHeader."
@@ -162,6 +189,20 @@ func applyAgentRuntimeSettings(settings *PluginSettings) {
 	}
 }
 
+// contextLimitsFromSettings maps the admin-configurable context-window
+// settings onto agent.ContextLimits. Unset (zero) fields resolve to the
+// historical defaults inside the agent loop.
+func contextLimitsFromSettings(settings PluginSettings) agent.ContextLimits {
+	return agent.ContextLimits{
+		MaxToolResponseTokens:                  settings.MaxToolResponseTokens,
+		AggressiveToolResponseTokens:           settings.AggressiveToolResponseTokens,
+		MaxHighVolumeToolResponseTokens:        settings.MaxHighVolumeToolResponseTokens,
+		AggressiveHighVolumeToolResponseTokens: settings.AggressiveHighVolumeToolResponseTokens,
+		KeepRecentToolResults:                  settings.KeepRecentToolResults,
+		ToolCallSummarizationDisabled:          settings.ToolCallSummarizationDisabled,
+	}
+}
+
 type Plugin struct {
 	backend.CallResourceHandler
 	logger         log.Logger
@@ -177,16 +218,31 @@ type Plugin struct {
 	approvalGrants ApprovalGrantStore
 	useBuiltInMCP  bool
 	promptRegistry *PromptRegistry
+	skillRegistry  *skills.Registry
 	settings       PluginSettings
 	settingsMu     sync.RWMutex
 	ctx            context.Context
 	cancel         context.CancelFunc
 	runCancelsMu   sync.Mutex
 	runCancels     map[string]context.CancelFunc
+	// oauthManager drives per-user OAuth for external MCP servers; it also
+	// implements mcp.PerUserTokenProvider for the proxy.
+	oauthManager *oauth.Manager
+	// dynamicServerStore persists MCP servers provisioned at runtime from the
+	// AppConfig UI so they survive restarts.
+	dynamicServerStore oauth.DynamicServerStore
+	// oauthHTTPClient is the SDK-built HTTP client used for OAuth discovery,
+	// dynamic client registration, and token exchange.
+	oauthHTTPClient *http.Client
 	// dsCache memoises the per-org datasource UID snapshot injected into the
 	// system prompt. See datasource_snapshot.go.
 	dsCache   map[string]dsCacheEntry
 	dsCacheMu sync.Mutex
+	// msCache memoises the per-org metric-namespace snapshot injected into the
+	// system prompt for alert investigations. See metric_namespace_snapshot.go.
+	msCache    map[string]dsCacheEntry
+	msCacheMu  sync.Mutex
+	msInFlight map[string]bool
 }
 
 func NewPlugin(ctx context.Context, settings backend.AppInstanceSettings) (instancemgmt.Instance, error) {
@@ -233,6 +289,9 @@ func NewPlugin(ctx context.Context, settings backend.AppInstanceSettings) (insta
 		promptRegistry, _ = NewPromptRegistry(PluginSettings{})
 	}
 
+	skillRegistry := skills.NewRegistry(pluginSettings.Skills, logger)
+	applyLegacyPromptOverrides(skillRegistry, pluginSettings, logger)
+
 	// Use a standalone context instead of the SDK-provided ctx.
 	// The SDK ctx is scoped to the factory call and gets cancelled
 	// after NewPlugin returns, which would cancel all child contexts.
@@ -269,17 +328,60 @@ func NewPlugin(ctx context.Context, settings backend.AppInstanceSettings) (insta
 		logger.Warn("Failed to create Redis client, falling back to in-memory storage", "error", redisErr.Error())
 	}
 
+	sessionTTL := resolveTTLDays(pluginSettings.SessionTTLDays, DefaultSessionTTLDays)
+
 	var runStore RunStoreInterface
 	var sessionStore SessionStoreInterface
 	if !usingRedis {
 		rateLimiter := NewInMemoryRateLimiter(logger)
 		shareStore = NewShareStore(logger, rateLimiter)
 		runStore = NewRunStore(logger)
-		sessionStore = NewSessionStore(logger)
+		sessionStore = NewSessionStore(logger, sessionTTL)
 		logger.Info("Using in-memory storage (not suitable for multi-replica deployments)")
 	} else {
 		runStore = NewRedisRunStore(pluginCtx, redisClient, logger)
-		sessionStore = NewRedisSessionStore(pluginCtx, redisClient, logger)
+		sessionStore = NewRedisSessionStore(pluginCtx, redisClient, logger, sessionTTL)
+	}
+
+	oauthHTTPClient, err := httpclient.New(httpclient.Options{
+		Timeouts: &httpclient.TimeoutOptions{
+			Timeout:     30 * time.Second,
+			DialTimeout: 10 * time.Second,
+		},
+	})
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to create SDK HTTP client for OAuth: %w", err)
+	}
+
+	var tokenStore oauth.UserTokenStore
+	var stateStore oauth.StateStore
+	var dynamicServerStore oauth.DynamicServerStore
+	if usingRedis && redisClient != nil {
+		tokenStore = oauth.NewRedisUserTokenStore(redisClient, logger)
+		stateStore = oauth.NewRedisStateStore(redisClient, logger)
+		dynamicServerStore = oauth.NewRedisDynamicServerStore(redisClient, logger)
+	} else {
+		tokenStore = oauth.NewInMemoryUserTokenStore()
+		stateStore = oauth.NewInMemoryStateStore()
+		dynamicServerStore = oauth.NewInMemoryDynamicServerStore()
+	}
+	oauthManager := oauth.NewManager(tokenStore, stateStore, oauthHTTPClient, logger, pluginSettings.MCPServers)
+	mcpProxy.SetPerUserTokenProvider(oauthManager)
+
+	// Restore dynamic (UI-added) MCP servers so they're attached before the
+	// first requests come in.
+	if dynamicRecords, err := dynamicServerStore.List(pluginCtx); err != nil {
+		logger.Warn("list dynamic MCP servers", "err", err)
+	} else {
+		for _, rec := range dynamicRecords {
+			if rec.Config.OAuth != nil {
+				oauthManager.RegisterConfig(rec.Config.ID, rec.Config.OAuth)
+			}
+			if err := mcpProxy.EnsureServer(rec.Config); err != nil {
+				logger.Warn("restore dynamic MCP server", "id", rec.Config.ID, "err", err)
+			}
+		}
 	}
 
 	var approvalBroker ApprovalBroker
@@ -307,14 +409,19 @@ func NewPlugin(ctx context.Context, settings backend.AppInstanceSettings) (insta
 	llmClient := agent.NewLLMClient(logger, llmHTTPClient)
 	agentLoop := agent.NewAgentLoop(llmClient, mcpProxy, logger)
 
-	var scout *Scout
-	if interval, ok := parseScanInterval(pluginSettings.GraphitiScanInterval); ok {
-		scout = NewScout(pluginCtx, agentLoop, mcpProxy, logger, interval, pluginSettings)
+	// scout is always constructed — even when discovery auto-scan is off —
+	// because handleAgentRun lazily feeds it orgID/GrafanaURL on every chat
+	// request (see p.scout.SetOrgID below), and RunRetention needs that same
+	// org binding to prune episodes independent of the discovery loop.
+	scanInterval, scanEnabled := parseScanInterval(pluginSettings.GraphitiScanInterval)
+	scout := NewScout(pluginCtx, agentLoop, mcpProxy, logger, scanInterval, pluginSettings)
+	if scanEnabled {
 		go scout.Start()
 		logger.Info("Scout started", "interval", pluginSettings.GraphitiScanInterval)
 	} else {
 		logger.Info("Scout auto-scan disabled (interval=off)")
 	}
+	go scout.StartRetention()
 
 	p := &Plugin{
 		logger:         logger,
@@ -330,10 +437,15 @@ func NewPlugin(ctx context.Context, settings backend.AppInstanceSettings) (insta
 		approvalGrants: approvalGrants,
 		useBuiltInMCP:  pluginSettings.UseBuiltInMCP,
 		promptRegistry: promptRegistry,
+		skillRegistry:  skillRegistry,
 		settings:       pluginSettings,
 		ctx:            pluginCtx,
 		cancel:         cancel,
 		runCancels:     make(map[string]context.CancelFunc),
+
+		oauthManager:       oauthManager,
+		dynamicServerStore: dynamicServerStore,
+		oauthHTTPClient:    oauthHTTPClient,
 	}
 
 	if !usingRedis {
@@ -344,6 +456,7 @@ func NewPlugin(ctx context.Context, settings backend.AppInstanceSettings) (insta
 				select {
 				case <-ticker.C:
 					shareStore.CleanupExpired()
+					sessionStore.CleanupOld()
 				case <-pluginCtx.Done():
 					return
 				}
@@ -449,6 +562,7 @@ func (p *Plugin) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/evals/run", p.handleAgentEvalRun)
 	mux.HandleFunc("/api/agent/topology", p.handleAgentTopology)
 	mux.HandleFunc("/api/prompt-defaults", p.handlePromptDefaults)
+	mux.HandleFunc("/api/skills", p.handleSkills)
 	mux.HandleFunc("/api/graphiti/discover", p.handleGraphitiDiscover)
 	mux.HandleFunc("/api/graphiti/status", p.handleGraphitiStatus)
 	mux.HandleFunc("/api/graphiti/ingest-session", p.handleGraphitiIngestSession)
@@ -461,6 +575,10 @@ func (p *Plugin) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/sessions/share/", p.handleDeleteShare)
 	mux.HandleFunc("/api/sessions/", p.handleSessionRouter)
 	mux.HandleFunc("/api/sessions", p.handleSessionsRoot)
+
+	// Per-user OAuth for external MCP servers + admin provisioning.
+	p.oauthManager.RegisterRoutes(mux, getUserID)
+	p.registerProvisionerRoutes(mux)
 
 	mux.HandleFunc("/", p.handleDefault)
 }
@@ -620,7 +738,7 @@ func (p *Plugin) handleMCPTools(w http.ResponseWriter, r *http.Request) {
 
 	p.ensureBuiltInForListing(r)
 
-	tools, err := p.mcpProxy.ListTools()
+	tools, err := p.mcpProxy.ListToolsWithContext(mcp.WithUserID(r.Context(), getUserID(r)))
 	if err != nil {
 		p.logger.Error("Failed to list tools", "error", err)
 		http.Error(w, "Failed to list tools", http.StatusInternalServerError)
@@ -695,7 +813,8 @@ func (p *Plugin) handleMCPCallTool(w http.ResponseWriter, r *http.Request) {
 
 	p.logger.Debug("Tool call context", "orgID", orgID, "orgName", req.OrgName, "scopeOrgId", req.ScopeOrgId, "tool", req.Name)
 
-	result, err := p.mcpProxy.CallToolWithContext(req.Name, req.Arguments, orgID, req.OrgName, req.ScopeOrgId)
+	callCtx := mcp.WithUserID(r.Context(), getUserID(r))
+	result, err := p.mcpProxy.CallToolWithContext(callCtx, req.Name, req.Arguments, orgID, req.OrgName, req.ScopeOrgId)
 	if err != nil {
 		p.logger.Error("Failed to call tool", "error", err)
 		http.Error(w, "Failed to call tool", http.StatusInternalServerError)
@@ -720,9 +839,32 @@ func (p *Plugin) handleMCPServers(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"servers":      serversHealth,
 		"systemHealth": systemHealth,
+		"oauth":        p.oauthStatusForUser(r),
 	}
 
 	json.NewEncoder(w).Encode(response)
+}
+
+// oauthStatusForUser returns serverID → {configured, connected, expiresAt}
+// for every MCP server with an OAuth block, telling the frontend whether the
+// current user still needs to click Connect.
+func (p *Plugin) oauthStatusForUser(r *http.Request) map[string]oauth.StatusResponse {
+	out := map[string]oauth.StatusResponse{}
+	if p.oauthManager == nil {
+		return out
+	}
+	userID := getUserID(r)
+	for _, id := range p.oauthManager.ServerIDs() {
+		status := oauth.StatusResponse{Configured: true}
+		if userID != 0 {
+			if tok, ok, err := p.oauthManager.Tokens().Get(r.Context(), id, userID); err == nil && ok {
+				status.Connected = !tok.Expired() || tok.RefreshToken != ""
+				status.ExpiresAt = tok.ExpiresAt
+			}
+		}
+		out[id] = status
+	}
+	return out
 }
 
 // Restore ordinary assistant/tool messages from the session's existing UI records.
@@ -794,6 +936,7 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 
 	userRole := getUserRole(r)
 	userID := getUserID(r)
+	userLogin := getUserLogin(r)
 	orgID := r.Header.Get("X-Grafana-Org-Id")
 	if orgID == "" {
 		orgID = "1"
@@ -857,7 +1000,26 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 
 	toolCtx := BuildToolContext(req.OrgName, userRole)
 	toolCtx.ConversationType = req.Type
+	toolCtx.Message = req.Message
+	toolCtx.IsAlertInvestigation = isAlertInvestigation(req.Type, req.Message)
 	toolCtx.DatasourceSnapshot = p.datasourceSnapshot(orgID, req.OrgName, req.ScopeOrgID)
+
+	activation, err := skills.Resolve(p.skillRegistry, req.Message, req.Skills, req.Type)
+	if err != nil {
+		p.logger.Warn("Invalid skill selection", "error", err, "type", req.Type)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	activeSkillNames := skills.ActiveNames(activation)
+	toolCtx.ActiveSkills = activation.Skills
+	toolCtx.SkillsCatalog = p.skillRegistry.Catalog(activeSkillNames...)
+	toolCtx.UserPromptSkill = activation.UserPromptSkill
+	if skills.HasActive(activation, skills.TypeSkillNames["investigation"]) {
+		// Only fetched for alert investigations: the underlying fetch is a
+		// (cached, backgrounded) scan of each Prometheus datasource's metric
+		// catalog, not worth the overhead for plain chat.
+		toolCtx.MetricNamespaceSnapshot = p.metricNamespaceSnapshot(orgID, req.OrgName, req.ScopeOrgID)
+	}
 
 	systemPrompt, err := p.promptRegistry.BuildSystemPrompt(toolCtx)
 	if err != nil {
@@ -955,17 +1117,22 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 
 	effectiveRunModel := runModel
 	if effectiveRunModel == "" {
-		effectiveRunModel = selectAgentModelForTask(req.Type, req.Message)
-		// Confirmation/retry turns belong to the same conversation task. Do not
-		// downgrade because the latest user message is only a short approval.
-		// Explicit request/session choices above remain authoritative.
-		for _, message := range messages {
-			if message.Role == "user" && selectAgentModelForTask(req.Type, message.Content) == agentModelLarge {
-				effectiveRunModel = agentModelLarge
-				break
+		if m := skills.ModelPreference(activation); m != "" {
+			effectiveRunModel = m
+			modelSource = "skill"
+		} else {
+			effectiveRunModel = selectAgentModelForTask(req.Type, req.Message)
+			// Confirmation/retry turns belong to the same conversation task. Do not
+			// downgrade because the latest user message is only a short approval.
+			// Explicit request/session choices above remain authoritative.
+			for _, message := range messages {
+				if message.Role == "user" && selectAgentModelForTask(req.Type, message.Content) == agentModelLarge {
+					effectiveRunModel = agentModelLarge
+					break
+				}
 			}
+			modelSource = "auto"
 		}
-		modelSource = "auto"
 	}
 
 	if err := p.sessionStore.SetActiveRunID(sessionID, userID, numericOrgID, runID); err != nil {
@@ -980,6 +1147,7 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 		"sessionId", sessionID,
 		"messageCount", len(messages),
 		"type", req.Type,
+		"skills", strings.Join(activeSkillNames, ","),
 		"model", effectiveRunModel,
 		"modelSource", modelSource,
 	)
@@ -992,20 +1160,32 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 
 	eventCh := make(chan agent.SSEEvent, 16)
 
+	maxIterations := skills.IterationBudget(activation)
+	if maxIterations == 0 {
+		maxIterations = resolveMaxIterations(req.Type, req.Message)
+	}
+
 	loopReq := agent.LoopRequest{
-		Messages:             messages,
-		SystemPrompt:         systemPrompt,
-		MaxTotalTokens:       p.settings.MaxTotalTokens,
-		RecentMessageCount:   p.settings.RecentMessageCount,
-		MaxIterations:        resolveMaxIterations(req.Type, req.Message),
-		Model:                effectiveRunModel,
-		AllowModelFallback:   modelSource == "auto" && effectiveRunModel == "large",
-		ConversationType:     req.Type,
+		Messages:           messages,
+		SystemPrompt:       systemPrompt,
+		MaxTotalTokens:     p.settings.MaxTotalTokens,
+		RecentMessageCount: p.settings.RecentMessageCount,
+		ContextLimits:      contextLimitsFromSettings(p.settings),
+		MaxIterations:      maxIterations,
+		Model:              effectiveRunModel,
+		AllowModelFallback: (modelSource == "auto" || modelSource == "skill") && effectiveRunModel == "large",
+		ConversationType:   req.Type,
+		RunID:              runID,
+		SessionID:          sessionID,
+		ActiveSkillsEvent:  skillEventInfos(activation.Skills),
+		AvailableSkills:    skillSpecs(toolCtx.SkillsCatalog),
+		LoadSkill: func(ctx context.Context, name, file string) (string, error) {
+			return p.skillRegistry.Load(name, file, toolCtx)
+		},
 		GrafanaURL:           grafanaURL,
 		AuthToken:            saToken,
 		UserRole:             userRole,
-		UserID:               strconv.FormatInt(userID, 10),
-		SessionID:            sessionID,
+		UserID:               userID,
 		UploadDatasetID:      uploadDatasetID,
 		OrgID:                orgID,
 		OrgName:              req.OrgName,
@@ -1027,7 +1207,7 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 
 	go p.agentLoop.Run(runCtx, loopReq, eventCh)
 	go func() {
-		p.consumeAgentEvents(runCtx, runID, sessionID, userID, numericOrgID, eventCh)
+		p.consumeAgentEvents(runCtx, runID, sessionID, userID, userLogin, numericOrgID, req.OrgName, effectiveRunModel, eventCh)
 		runCancel()
 		p.runCancelsMu.Lock()
 		delete(p.runCancels, runID)
@@ -1044,18 +1224,64 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (p *Plugin) consumeAgentEvents(ctx context.Context, runID, sessionID string, userID, orgID int64, eventCh <-chan agent.SSEEvent) {
+func (p *Plugin) consumeAgentEvents(ctx context.Context, runID, sessionID string, userID int64, userLogin string, orgID int64, orgName string, effectiveModel string, eventCh <-chan agent.SSEEvent) {
 	var lastEvent agent.SSEEvent
 	var allEvents []agent.SSEEvent
 	for event := range eventCh {
+		// Persist session stats before exposing the done event to reconnecting
+		// clients. The frontend refreshes sessions as soon as it sees done, so
+		// incrementing after the loop would race with GET /stats returning zeros.
+		if event.Type == "done" && sessionID != "" {
+			if de, ok := event.Data.(agent.DoneEvent); ok {
+				delta := SessionStatsDelta{
+					RunCount:         1,
+					TotalIterations:  de.TotalIterations,
+					ToolCallCount:    de.ToolCallCount,
+					PromptTokens:     de.PromptTokens,
+					CompletionTokens: de.CompletionTokens,
+					TotalTokens:      de.TotalTokens,
+				}
+				if err := p.sessionStore.IncrementStats(sessionID, userID, orgID, delta); err != nil {
+					p.logger.Warn("Failed to increment session stats", "error", err, "sessionId", sessionID)
+				}
+			}
+		}
+
 		p.runStore.AppendEvent(runID, event)
 		allEvents = append(allEvents, event)
 		lastEvent = event
 	}
 
+	userStr := fmt.Sprintf("%d", userID)
+	orgStr := fmt.Sprintf("%d", orgID)
+	orgName = sanitizeOrgNameLabel(orgName)
+
 	switch lastEvent.Type {
 	case "done":
 		p.runStore.FinishRun(runID, RunStatusCompleted, "")
+		var usageMap map[string]agent.ModelUsage
+		if de, ok := lastEvent.Data.(agent.DoneEvent); ok {
+			usageMap = de.UsageByModel
+		} else if pdone, ok := lastEvent.Data.(*agent.DoneEvent); ok && pdone != nil {
+			usageMap = pdone.UsageByModel
+		}
+
+		if len(usageMap) == 0 {
+			if de, ok := lastEvent.Data.(agent.DoneEvent); ok && de.TotalTokens > 0 {
+				modelKey := effectiveModel
+				if modelKey == "" {
+					modelKey = "base"
+				}
+				agentUserTokens.WithLabelValues(userStr, userLogin, modelKey, "prompt", orgStr, orgName).Add(float64(de.PromptTokens))
+				agentUserTokens.WithLabelValues(userStr, userLogin, modelKey, "completion", orgStr, orgName).Add(float64(de.CompletionTokens))
+			}
+		} else {
+			for model, usage := range usageMap {
+				agentUserTokens.WithLabelValues(userStr, userLogin, model, "prompt", orgStr, orgName).Add(float64(usage.PromptTokens))
+				agentUserTokens.WithLabelValues(userStr, userLogin, model, "completion", orgStr, orgName).Add(float64(usage.CompletionTokens))
+			}
+		}
+
 	case "error":
 		var errMsg string
 		if ee, ok := lastEvent.Data.(agent.ErrorEvent); ok {
@@ -1076,6 +1302,45 @@ func (p *Plugin) consumeAgentEvents(ctx context.Context, runID, sessionID string
 			p.logger.Warn("Failed to append assistant message to session", "error", err, "sessionId", sessionID)
 		}
 		p.sessionStore.ClearActiveRunID(sessionID, userID, orgID)
+
+		if lastEvent.Type == "done" && !p.settings.GraphitiAutoSaveSessionsDisabled && p.isGraphitiAvailable() {
+			p.autoSaveSessionToGraphiti(sessionID, userID, orgID)
+		}
+	}
+}
+
+// autoSaveSessionToGraphiti feeds a session's messages into the knowledge
+// graph after every completed run, mirroring the manual "Feed to Knowledge
+// Graph" action (handleGraphitiIngestSession) so investigation findings are
+// captured by default. Disable via settings.graphitiAutoSaveSessionsDisabled.
+// Best-effort: failures are logged, never surfaced mid-conversation.
+func (p *Plugin) autoSaveSessionToGraphiti(sessionID string, userID, orgID int64) {
+	session, err := p.sessionStore.GetSession(sessionID, userID, orgID)
+	if err != nil {
+		p.logger.Warn("Auto-save: failed to load session", "error", err, "sessionId", sessionID)
+		return
+	}
+
+	messages := make([]ingestSessionMessage, len(session.Messages))
+	for i, m := range session.Messages {
+		messages[i] = ingestSessionMessage{Role: m.Role, Content: m.Content}
+	}
+
+	body, count := buildSessionMemoryBody(messages)
+	if count == 0 {
+		return
+	}
+
+	if err := ingestGraphitiMemory(
+		p.mcpProxy,
+		orgID,
+		"investigation_session",
+		body,
+		"message",
+		"Ask O11y investigation session (auto-saved)",
+	); err != nil {
+		p.logger.Warn("Auto-save: failed to ingest session into knowledge graph",
+			"error", err, "sessionId", sessionID, "orgID", orgID)
 	}
 }
 
@@ -1388,6 +1653,7 @@ func (p *Plugin) handleAgentRunEvents(w http.ResponseWriter, r *http.Request, ru
 		return
 	}
 
+	lastEmitted := int64(-1)
 	for _, event := range run.Events {
 		data, err := agent.MarshalSSE(event)
 		if err != nil {
@@ -1397,6 +1663,7 @@ func (p *Plugin) handleAgentRunEvents(w http.ResponseWriter, r *http.Request, ru
 		if _, err := w.Write(data); err != nil {
 			return
 		}
+		lastEmitted = event.Sequence
 	}
 	flusher.Flush()
 
@@ -1416,6 +1683,18 @@ func (p *Plugin) handleAgentRunEvents(w http.ResponseWriter, r *http.Request, ru
 			if !ok {
 				return
 			}
+			if event.Sequence <= lastEmitted {
+				continue
+			}
+			// Pub/sub is at-most-once, so a dropped message leaves a hole that a
+			// later delivered event (including the terminal one) would paper over.
+			// Close the stream instead: the client's reconnect replays the durable
+			// list, which is complete.
+			if lastEmitted >= 0 && event.Sequence > lastEmitted+1 {
+				p.logger.Warn("Gap in live run event sequence, closing stream so the client replays from storage",
+					"runId", runID, "expected", lastEmitted+1, "received", event.Sequence)
+				return
+			}
 			data, err := agent.MarshalSSE(event)
 			if err != nil {
 				p.logger.Error("Failed to marshal SSE event", "error", err, "runId", runID, "eventType", event.Type)
@@ -1423,6 +1702,7 @@ func (p *Plugin) handleAgentRunEvents(w http.ResponseWriter, r *http.Request, ru
 			}
 			w.Write(data)
 			flusher.Flush()
+			lastEmitted = event.Sequence
 		case <-keepalive.C:
 			w.Write([]byte(": keepalive\n\n"))
 			flusher.Flush()
@@ -1438,12 +1718,97 @@ func (p *Plugin) handlePromptDefaults(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	defaults := map[string]string{
 		"defaultSystemPrompt": DefaultSystemPrompt,
-		"investigationPrompt": DefaultInvestigationPrompt,
-		"performancePrompt":   DefaultPerformancePrompt,
+	}
+	// The investigation/performance user-prompt templates now live in the
+	// bundled skills. The keys are always present for contract stability:
+	// an active skill contributes its (possibly overridden) template, and a
+	// disabled skill still falls back to the shipped bundled default.
+	for key, skillName := range map[string]string{
+		"investigationPrompt": skills.TypeSkillNames["investigation"],
+		"performancePrompt":   skills.TypeSkillNames["performance"],
+	} {
+		value := p.skillRegistry.BundledUserPrompt(skillName)
+		if s, ok := p.skillRegistry.Get(skillName); ok {
+			value = s.UserPrompt
+		}
+		defaults[key] = value
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(defaults)
+}
+
+// handleSkills lists skill metadata for the chat slash commands and the
+// AppConfig Skills tab. Safe for all roles; hidden skills are excluded —
+// they are never offered to users or the model. Admins may pass
+// ?include=content to receive every skill (hidden included) with its
+// SKILL.md source for the editor.
+func (p *Plugin) handleSkills(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var infos []skills.Info
+	if r.URL.Query().Get("include") == "content" {
+		if getUserRole(r) != "Admin" {
+			http.Error(w, "Admin role required to read skill content", http.StatusForbidden)
+			return
+		}
+		infos = p.skillRegistry.InfosWithContent()
+	} else {
+		infos = p.skillRegistry.PublicInfos()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"skills": infos,
 	})
+}
+
+func skillSpecs(list []*skills.Skill) []agent.SkillSpec {
+	if len(list) == 0 {
+		return nil
+	}
+	out := make([]agent.SkillSpec, 0, len(list))
+	for _, s := range list {
+		out = append(out, agent.SkillSpec{Name: s.Name, Description: s.Description})
+	}
+	return out
+}
+
+func skillEventInfos(list []*skills.Skill) []agent.RunStartedSkill {
+	if len(list) == 0 {
+		return nil
+	}
+	out := make([]agent.RunStartedSkill, 0, len(list))
+	for _, s := range list {
+		out = append(out, agent.RunStartedSkill{Name: s.Name, Description: s.Description})
+	}
+	return out
+}
+
+// applyLegacyPromptOverrides keeps pre-skills jsonData prompt customizations
+// working: a configured investigationPrompt/performancePrompt replaces the
+// matching bundled skill's user-prompt template — but only until the admin
+// manages that skill through the Skills tab (any entry for it exists), which
+// takes precedence so the override can be changed or cleared there.
+func applyLegacyPromptOverrides(registry *skills.Registry, settings PluginSettings, logger log.Logger) {
+	legacyFields := map[string]string{
+		skills.TypeSkillNames["investigation"]: settings.InvestigationPrompt,
+		skills.TypeSkillNames["performance"]:   settings.PerformancePrompt,
+	}
+	for skillName, legacyPrompt := range legacyFields {
+		if legacyPrompt == "" {
+			continue
+		}
+		if registry.HasEntry(skillName) {
+			logger.Info("Legacy prompt field ignored — skill is managed in the Skills tab", "skill", skillName)
+			continue
+		}
+		if err := registry.SetUserPromptOverride(skillName, legacyPrompt); err != nil {
+			logger.Warn("Legacy prompt override not applied — edit the skill in the Skills tab instead", "skill", skillName, "error", err)
+		}
+	}
 }
 
 func (p *Plugin) handleAgentEvals(w http.ResponseWriter, r *http.Request) {
@@ -1569,6 +1934,7 @@ func (p *Plugin) handleAgentTopology(w http.ResponseWriter, r *http.Request) {
 		query = graphitiTopologyFactQuery()
 	}
 	result, err := p.mcpProxy.CallToolWithContext(
+		r.Context(),
 		toolName,
 		graphitiSearchFactsArgs(tools, toolName, orgID, query, maxEdges),
 		strconv.FormatInt(orgID, 10),
@@ -1591,6 +1957,7 @@ func (p *Plugin) handleAgentTopology(w http.ResponseWriter, r *http.Request) {
 	} else {
 		for _, nodeQuery := range graphitiTopologyNodeQueries() {
 			nodeResult, nodeErr := p.mcpProxy.CallToolWithContext(
+				r.Context(),
 				nodeToolName,
 				graphitiSearchNodesArgs(tools, nodeToolName, orgID, nodeQuery.query, hardTopologyMaxNodes, nodeQuery.entityTypes),
 				strconv.FormatInt(orgID, 10),
@@ -1620,6 +1987,7 @@ func (p *Plugin) handleAgentTopology(w http.ResponseWriter, r *http.Request) {
 		centerFactLimit := topologyCenteredFactLimit(maxEdges, len(centerNodes))
 		for _, node := range centerNodes {
 			nodeResult, nodeErr := p.mcpProxy.CallToolWithContext(
+				r.Context(),
 				toolName,
 				graphitiSearchFactsForNodeArgs(tools, toolName, orgID, graphitiTopologyFactQuery(), centerFactLimit, node.UUID),
 				strconv.FormatInt(orgID, 10),
@@ -1695,6 +2063,17 @@ func getUserID(r *http.Request) int64 {
 	}
 
 	return 0
+}
+
+func getUserLogin(r *http.Request) string {
+	pluginContext := httpadapter.PluginConfigFromContext(r.Context())
+	if pluginContext.User != nil && pluginContext.User.Login != "" {
+		return pluginContext.User.Login
+	}
+	if pluginContext.User != nil && pluginContext.User.Email != "" {
+		return pluginContext.User.Email
+	}
+	return "unknown"
 }
 
 // isGraphitiAvailable returns true when the graphiti MCP server is registered
@@ -1780,12 +2159,13 @@ func (p *Plugin) handleGraphitiDiscover(w http.ResponseWriter, r *http.Request) 
 		SystemPrompt:       GraphitiDiscoverySystemPrompt,
 		MaxTotalTokens:     p.settings.MaxTotalTokens,
 		RecentMessageCount: p.settings.RecentMessageCount,
+		ContextLimits:      contextLimitsFromSettings(p.settings),
 		MaxIterations:      GraphitiDiscoveryMaxIter,
 		Model:              agentModelLarge,
 		GrafanaURL:         grafanaURL,
 		AuthToken:          saToken,
 		UserRole:           userRole,
-		UserID:             strconv.FormatInt(userID, 10),
+		UserID:             userID,
 		OrgID:              strconv.FormatInt(orgID, 10),
 		OrgName:            "Org" + strconv.FormatInt(orgID, 10),
 		ExcludeToolNames:   graphitiWriteToolNames,
@@ -2278,7 +2658,8 @@ func (p *Plugin) handleSessionCurrent(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleSessionRouter dispatches /api/sessions/{id} and /api/sessions/{id}/shares.
+// handleSessionRouter dispatches /api/sessions/{id}, /api/sessions/{id}/shares,
+// and /api/sessions/{id}/stats.
 func (p *Plugin) handleSessionRouter(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	prefix := "/api/sessions/"
@@ -2302,6 +2683,16 @@ func (p *Plugin) handleSessionRouter(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.handleGetSessionShares(w, r, sessionID)
+		return
+	}
+
+	// /api/sessions/{id}/stats → usage stats for session
+	if sessionID, isStats := strings.CutSuffix(remainder, "/stats"); isStats {
+		if !isValidSecureID(sessionID) {
+			http.Error(w, "Invalid session ID format", http.StatusBadRequest)
+			return
+		}
+		p.handleGetSessionStats(w, r, sessionID)
 		return
 	}
 
@@ -2392,6 +2783,39 @@ func (p *Plugin) handleGetSessionShares(w http.ResponseWriter, r *http.Request, 
 	json.NewEncoder(w).Encode(userShares)
 }
 
+// handleGetSessionStats returns cumulative usage stats for a session (tokens,
+// turns, tool calls), accumulated across all agent runs the session has had.
+// Unlike GET /api/sessions/{id}, this omits the full message history so
+// callers tracking usage across many sessions don't have to pull transcripts.
+func (p *Plugin) handleGetSessionStats(w http.ResponseWriter, r *http.Request, sessionID string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := getUserID(r)
+	orgID := getOrgID(r)
+
+	session, err := p.sessionStore.GetSession(sessionID, userID, orgID)
+	if err != nil {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":        session.ID,
+		"runCount":         session.RunCount,
+		"totalIterations":  session.TotalIterations,
+		"toolCallCount":    session.ToolCallCount,
+		"promptTokens":     session.PromptTokens,
+		"completionTokens": session.CompletionTokens,
+		"totalTokens":      session.TotalTokens,
+		"createdAt":        session.CreatedAt,
+		"updatedAt":        session.UpdatedAt,
+	})
+}
+
 func generateSessionTitleFromType(convType, message string) string {
 	const maxTitleLen = 50
 	switch convType {
@@ -2434,6 +2858,7 @@ func truncateTitle(s string, maxLen int) string {
 
 func reconstructAssistantMessage(events []agent.SSEEvent) SessionMessage {
 	var content string
+	var tokenUsageRaw json.RawMessage
 	// Merge tool_call_start and tool_call_result by ID so each tool call
 	// produces exactly one entry (no duplicates when reopening a session).
 	toolCallsByID := make(map[string]map[string]interface{})
@@ -2441,6 +2866,18 @@ func reconstructAssistantMessage(events []agent.SSEEvent) SessionMessage {
 
 	for _, e := range events {
 		switch e.Type {
+		case "done":
+			if de, ok := e.Data.(agent.DoneEvent); ok && de.UsageByModel != nil {
+				if data, err := json.Marshal(de.UsageByModel); err == nil {
+					tokenUsageRaw = data
+				}
+			} else if m, ok := e.Data.(map[string]interface{}); ok {
+				if usage, exists := m["usageByModel"]; exists && usage != nil {
+					if data, err := json.Marshal(usage); err == nil {
+						tokenUsageRaw = data
+					}
+				}
+			}
 		case "content":
 			if ce, ok := e.Data.(agent.ContentEvent); ok {
 				content += ce.Content
@@ -2505,8 +2942,9 @@ func reconstructAssistantMessage(events []agent.SSEEvent) SessionMessage {
 	}
 
 	msg := SessionMessage{
-		Role:    "assistant",
-		Content: content,
+		Role:       "assistant",
+		Content:    content,
+		TokenUsage: tokenUsageRaw,
 	}
 
 	if len(toolCallOrder) > 0 {

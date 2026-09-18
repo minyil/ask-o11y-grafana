@@ -15,6 +15,7 @@ import {
   HistoryButton,
   SaveToMemoryButton,
   ModelSelector,
+  McpConnectionsButton,
 } from './components';
 import { ChatInputRef } from './components/ChatInput/ChatInput';
 import { ChatErrorBoundary } from '../ErrorBoundary';
@@ -29,6 +30,7 @@ import {
   type LLMModelOption,
   type LLMModelSelection,
 } from '../../services/llmModels';
+import { listSkills, toSkillCommands, type SkillCommand } from '../../services/skillsClient';
 
 interface ChatProps {
   pluginSettings: AppPluginSettings;
@@ -36,6 +38,7 @@ interface ChatProps {
   initialSession?: { id?: string; messages?: ChatMessage[] };
   initialMessage?: string;
   initialMessageType?: 'chat' | 'investigation' | 'performance';
+  initialSkill?: string;
   sessionIdFromUrl: string | null;
   onSessionIdChange: (sessionId: string | null) => void;
 }
@@ -46,6 +49,7 @@ function ChatComponent({
   initialSession,
   initialMessage,
   initialMessageType,
+  initialSkill,
   sessionIdFromUrl,
   onSessionIdChange,
 }: ChatProps): React.ReactElement | null {
@@ -53,6 +57,7 @@ function ChatComponent({
   const allowEmbedding = useEmbeddingAllowed();
   const [modelOptions, setModelOptions] = useState<LLMModelOption[]>([]);
   const [selectedModel, setSelectedModel] = useState<LLMModelSelection>('auto');
+  const [skillCommands, setSkillCommands] = useState<SkillCommand[]>([]);
   const [uploaded, setUploaded] = useState<{ dataset: UploadedDataset; sessionId: string } | null>(null);
 
   const kioskModeEnabled = pluginSettings?.kioskModeEnabled ?? true;
@@ -73,10 +78,21 @@ function ChatComponent({
           setModelOptions([]);
         }
       });
+    listSkills()
+      .then((skills) => {
+        if (!cancelled) {
+          setSkillCommands(toSkillCommands(skills));
+        }
+      })
+      .catch(() => {
+        // Skills are optional; the slash menu simply stays hidden.
+      });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  const skillNames = useMemo(() => skillCommands.map((command) => command.name), [skillCommands]);
 
   const {
     chatHistory,
@@ -102,7 +118,9 @@ function ChatComponent({
     readOnly,
     initialMessage,
     initialMessageType,
-    selectedModel
+    selectedModel,
+    initialSkill,
+    skillNames
   );
 
   const chatInputRef = useRef<ChatInputRef>(null);
@@ -131,8 +149,8 @@ function ChatComponent({
   useKeyboardNavigation(containerRef);
 
   const handleSuggestionClick = useCallback(
-    (message: string) => {
-      setCurrentInput(message);
+    (message: string, skill?: string) => {
+      setCurrentInput(skill ? `/${skill} ${message}` : message);
       setTimeout(() => {
         chatInputRef.current?.focus();
       }, 100);
@@ -221,10 +239,12 @@ function ChatComponent({
       rightSlot: (
         <div className="flex items-center gap-1">
           {graphitiEnabled && hasMessages && <SaveToMemoryButton messages={chatHistory} />}
+          <McpConnectionsButton />
           <HistoryButton onClick={openHistory} sessionCount={sessionManager.sessions.length} />
         </div>
       ),
       readOnly,
+      skillCommands,
       onSuggestionClick: handleSuggestionClick,
       queuedMessageCount: messageQueue.length,
       onStopGeneration: stopGeneration,
@@ -248,6 +268,7 @@ function ChatComponent({
       bottomSpacerRef,
       hasMessages,
       modelSelector,
+      skillCommands,
       graphitiEnabled,
       clearChat,
       handleUploaded,

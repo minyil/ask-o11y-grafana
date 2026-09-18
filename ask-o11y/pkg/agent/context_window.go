@@ -2,14 +2,70 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"strings"
+	"unicode"
 )
 
-const DefaultMaxTotalTokens = 128_000
+// DefaultMaxTotalTokens was 128,000 until a production cost audit (Aug 2026)
+// found the agent loop resending near-max-context on almost every iteration —
+// with no prompt caching on the OpenAI-compat LLM transport, each iteration
+// billed the full window from scratch. Halved to shrink that per-iteration
+// cost; admins can still raise it via PluginSettings.MaxTotalTokens.
+const DefaultMaxTotalTokens = 64_000
 const defaultRecentMessageCount = 15
 const systemMessageBuffer = 1000
-const maxToolResponseTokens = 8000
-const aggressiveToolResponseTokens = 2000
+
+// Default per-tool-result trim caps for the two trim passes (normal, then
+// aggressive) and the high-volume variants applied to raw-data query tools
+// (Loki/Prometheus/Tempo/Pyroscope/dashboard JSON). Admin-configurable via
+// ContextLimits.
+const DefaultMaxToolResponseTokens = 8000
+const DefaultAggressiveToolResponseTokens = 2000
+const DefaultMaxHighVolumeToolResponseTokens = 3000
+const DefaultAggressiveHighVolumeToolResponseTokens = 800
+
+// DefaultKeepRecentToolResults bounds how many of the most recent tool results
+// stay in full in the resent context; older ones are replaced by a short
+// placeholder via evictStaleToolResults. This is the manual equivalent of
+// Anthropic's context-editing (clear_tool_uses) strategy, needed because the
+// OpenAI-compat LLM transport has no server-side caching or context editing.
+// Admin-configurable via ContextLimits.KeepRecentToolResults.
+const DefaultKeepRecentToolResults = 8
+
+// ContextLimits holds the admin-configurable context-window management knobs:
+// per-tool-result trim caps, how many recent tool results stay raw before
+// eviction, and whether evicted results are LLM-summarized. The zero value is
+// valid — withDefaults resolves it to the historical hard-coded behavior, so
+// callers that don't care keep working unchanged.
+type ContextLimits struct {
+	MaxToolResponseTokens                  int
+	AggressiveToolResponseTokens           int
+	MaxHighVolumeToolResponseTokens        int
+	AggressiveHighVolumeToolResponseTokens int
+	KeepRecentToolResults                  int
+	ToolCallSummarizationDisabled          bool
+}
+
+func (l ContextLimits) withDefaults() ContextLimits {
+	if l.MaxToolResponseTokens <= 0 {
+		l.MaxToolResponseTokens = DefaultMaxToolResponseTokens
+	}
+	if l.AggressiveToolResponseTokens <= 0 {
+		l.AggressiveToolResponseTokens = DefaultAggressiveToolResponseTokens
+	}
+	if l.MaxHighVolumeToolResponseTokens <= 0 {
+		l.MaxHighVolumeToolResponseTokens = DefaultMaxHighVolumeToolResponseTokens
+	}
+	if l.AggressiveHighVolumeToolResponseTokens <= 0 {
+		l.AggressiveHighVolumeToolResponseTokens = DefaultAggressiveHighVolumeToolResponseTokens
+	}
+	if l.KeepRecentToolResults <= 0 {
+		l.KeepRecentToolResults = DefaultKeepRecentToolResults
+	}
+	return l
+}
 
 // TruncationMarker is the prefix used to detect an existing truncation notice
 // so repeated trims in the same run don't stack duplicates.
@@ -20,8 +76,67 @@ const TruncationMarker = "[NOTICE: Conversation history truncated."
 // of the window, so the LLM knows prior context is gone and must re-query.
 const TruncationNotice = TruncationMarker + " Earlier messages are no longer visible — re-query tools if you need prior data.]"
 
+// EvictedToolResultMarker prefixes a stale tool result's replacement content
+// so repeated eviction passes over the same message are idempotent.
+const EvictedToolResultMarker = "[NOTICE: Tool result evicted to save context."
+
+// highVolumeToolNamePatterns match tool names whose results tend to be large,
+// raw query output (log lines, metric samples, trace spans, dashboard JSON)
+// rather than a short summary. Matched case-insensitively as a substring.
+var highVolumeToolNamePatterns = []string{
+	"query", "logs", "loki", "prometheus", "tempo", "trace", "pyroscope", "dashboard",
+}
+
+func isHighVolumeTool(toolName string) bool {
+	lower := strings.ToLower(toolName)
+	for _, p := range highVolumeToolNamePatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// structuredContentCharsPerToken and proseCharsPerToken bound EstimateTokens.
+// A flat chars/4 ratio is tuned for English prose; dense structured content
+// (JSON tool results, metric/label listings, dashboard payloads) packs more
+// tokens per character because delimiters, quotes, and short numeric or
+// identifier fields each cost close to a full token. A production trace
+// (2026-09-01) showed a single LLM call actually billed 291K prompt tokens
+// against an estimated-under-budget request, because the flat ratio let a
+// context dominated by tool-result JSON through without triggering the trim
+// pass early enough. Tool results are the dominant source of context growth
+// (see DefaultKeepRecentToolResults), so undercounting them is what matters most.
+const proseCharsPerToken = 4.0
+const structuredContentCharsPerToken = 2.5
+
 func EstimateTokens(text string) int {
-	return (len(text) + 3) / 4
+	if text == "" {
+		return 0
+	}
+	charsPerToken := proseCharsPerToken
+	if looksStructured(text) {
+		charsPerToken = structuredContentCharsPerToken
+	}
+	return int(math.Ceil(float64(len(text)) / charsPerToken))
+}
+
+// looksStructured reports whether text reads as dense structured data (JSON,
+// metric/label output) rather than prose, using the fraction of letter
+// characters as a proxy: prose is mostly letters, while structured data is
+// dominated by punctuation, digits, and short quoted tokens.
+func looksStructured(text string) bool {
+	letters, total := 0, 0
+	for _, r := range text {
+		total++
+		if unicode.IsLetter(r) {
+			letters++
+		}
+	}
+	if total == 0 {
+		return false
+	}
+	return float64(letters)/float64(total) < 0.55
 }
 
 func estimateMessagesTokens(messages []Message, tools []OpenAITool) int {
@@ -83,21 +198,27 @@ func sanitizeMessages(messages []Message) []Message {
 	return out
 }
 
-func TrimMessagesToTokenLimit(messages []Message, tools []OpenAITool, maxTokens int) []Message {
+// TrimMessagesToTokenLimit trims tool responses and drops old messages to fit
+// the token budget. limits resolves its zero value to the default trim caps,
+// so callers can pass ContextLimits{} for the historical behavior.
+func TrimMessagesToTokenLimit(messages []Message, tools []OpenAITool, maxTokens int, limits ContextLimits) []Message {
 	if maxTokens <= 0 {
 		maxTokens = DefaultMaxTotalTokens
 	}
+	limits = limits.withDefaults()
 
 	if estimateMessagesTokens(messages, tools) <= maxTokens {
 		return messages
 	}
 
-	trimmed := trimToolResponses(messages, maxToolResponseTokens)
+	toolNames := toolNamesByCallID(messages)
+
+	trimmed := trimToolResponses(messages, limits.MaxToolResponseTokens, limits.MaxHighVolumeToolResponseTokens, toolNames)
 	if estimateMessagesTokens(trimmed, tools) <= maxTokens {
 		return trimmed
 	}
 
-	trimmed = trimToolResponses(trimmed, aggressiveToolResponseTokens)
+	trimmed = trimToolResponses(trimmed, limits.AggressiveToolResponseTokens, limits.AggressiveHighVolumeToolResponseTokens, toolNames)
 	if estimateMessagesTokens(trimmed, tools) <= maxTokens {
 		return trimmed
 	}
@@ -157,17 +278,115 @@ func hasTruncationNotice(messages []Message) bool {
 	return false
 }
 
-func trimToolResponses(messages []Message, maxTokens int) []Message {
+func trimToolResponses(messages []Message, maxTokens, maxTokensHighVolume int, toolNames map[string]string) []Message {
 	out := make([]Message, len(messages))
 	for i, m := range messages {
-		if m.Role == "tool" && EstimateTokens(m.Content) > maxTokens {
-			maxChars := maxTokens * 4
+		limit := maxTokens
+		if isHighVolumeTool(toolNames[m.ToolCallID]) {
+			limit = maxTokensHighVolume
+		}
+		if m.Role == "tool" && EstimateTokens(m.Content) > limit {
+			// Use the same chars-per-token ratio EstimateTokens will apply when
+			// re-checking this content, so a single trim pass actually lands
+			// under limit instead of still estimating ~1.6x over it for
+			// structured content and falling through to more aggressive
+			// truncation than necessary.
+			charsPerToken := proseCharsPerToken
+			if looksStructured(m.Content) {
+				charsPerToken = structuredContentCharsPerToken
+			}
+			maxChars := int(float64(limit) * charsPerToken)
 			if maxChars > len(m.Content) {
 				maxChars = len(m.Content)
 			}
 			m.Content = m.Content[:maxChars] + "\n[...truncated]"
 		}
 		out[i] = m
+	}
+	return out
+}
+
+// toolNamesByCallID maps each tool_call id to the function name the assistant
+// invoked it with, so later passes (truncation, eviction) can key limits and
+// placeholders off the tool name even though the "tool" role message that
+// carries the result only stores the call id.
+func toolNamesByCallID(messages []Message) map[string]string {
+	names := make(map[string]string)
+	for _, m := range messages {
+		for _, tc := range m.ToolCalls {
+			names[tc.ID] = tc.Function.Name
+		}
+	}
+	return names
+}
+
+// evictStaleToolResults replaces the content of all but the most recent
+// keepRecent tool results with a short placeholder. Without prompt caching on
+// the LLM transport, every iteration re-bills the full accumulated tool-call
+// history from scratch — this is the manual equivalent of Anthropic's
+// context-editing (clear_tool_uses) strategy: it shrinks what's actually
+// transmitted instead of relying on a cache discount that isn't available.
+// The placeholder names the tool so the model can re-call it if it still
+// needs that data. Idempotent: already-evicted messages are left alone.
+// toolResultSummarizer condenses a stale tool result's content into a short
+// summary the model can keep in context instead of the raw payload. Called at
+// most once per tool result (evictStaleToolResults is idempotent), so an
+// LLM-backed implementation is a reasonable one-time cost against the much
+// larger savings of not resending the raw content every remaining iteration.
+// Receives the tool_call id so callers can resolve a summary that was already
+// kicked off in the background (see loop.go's pendingSummaries) instead of
+// blocking here.
+type toolResultSummarizer func(toolCallID, toolName, content string) string
+
+func evictStaleToolResults(messages []Message, keepRecent int, summarize toolResultSummarizer, isError func(toolCallID string) bool) []Message {
+	if keepRecent <= 0 {
+		keepRecent = DefaultKeepRecentToolResults
+	}
+
+	var toolIdx []int
+	for i, m := range messages {
+		if m.Role == "tool" {
+			toolIdx = append(toolIdx, i)
+		}
+	}
+	if len(toolIdx) <= keepRecent {
+		return messages
+	}
+
+	toolNames := toolNamesByCallID(messages)
+	staleIdx := toolIdx[:len(toolIdx)-keepRecent]
+
+	out := make([]Message, len(messages))
+	copy(out, messages)
+	for _, i := range staleIdx {
+		m := out[i]
+		if strings.HasPrefix(m.Content, EvictedToolResultMarker) {
+			continue
+		}
+		name := toolNames[m.ToolCallID]
+		if name == "" {
+			name = "unknown tool"
+		}
+
+		var summary string
+		if isError != nil && isError(m.ToolCallID) {
+			// Error results are short, deterministic diagnostics — one of them
+			// is the anti-hallucination "do not fabricate output" directive on
+			// transport failures. Never paraphrase these through an LLM; keep
+			// the exact wording (truncated only if unexpectedly long).
+			summary = truncateWhitespace(m.Content, evictionSummaryFallbackChars)
+		} else if summarize != nil {
+			summary = strings.TrimSpace(summarize(m.ToolCallID, name, m.Content))
+		}
+		if summary == "" {
+			summary = "no summary available"
+		}
+
+		out[i] = Message{
+			Role:       m.Role,
+			ToolCallID: m.ToolCallID,
+			Content:    fmt.Sprintf("%s Tool: %s. Summary: %s Re-call the tool if you need the full data again.]", EvictedToolResultMarker, name, summary),
+		}
 	}
 	return out
 }

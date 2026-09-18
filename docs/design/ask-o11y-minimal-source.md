@@ -2,6 +2,19 @@
 
 2026-09-15 新增：使用者核准在 dashboard preview header 匯出單檔離線 HTML，並核准本機官方 Image Renderer／Grafana 設定及 Ask O11y 部署；維持 main-only、不更動既有 dashboard、不公開分享。設計、限制與驗證見 [Dashboard HTML 匯出](dashboard-html-export.md)。此授權只覆蓋該功能，不擴張下列歷史任務範圍。
 
+## Upstream 同步（2026-09-18，本機，未推送）
+
+`ask-o11y/` 由 upstream `v0.3.2`（`8395ae1`）改為 **`v0.3.16`（`f713d5f`）** 為基底，fork 差異以 3-way rebase 重新套上（`feature/ask-o11y-minimal-llm-upstream-0.3.16`）。合併時的取捨：
+
+- **Actor/session header** 改走 upstream 的 request context（`mcp.WithUserID` / 新增 `mcp.WithSessionID`），由 `customRoundTripper` 依 `req.Context()` 設定 `X-Grafana-Actor-User-Id` / `X-Grafana-Session-Id`；移除 fork 自有的 `CallToolForRequest` / `connectMCPWithActorAndSessionContext` API。`_server_session_id` 仍由 loop 注入以防模型偽造，但送 MCP 前剝除。
+- **保留 fork 安全語意**：每次 tool call 使用獨立 client（不共用 session）；transport error 只對 read-only 工具自動重試，`update_dashboard` / `execute_python_*` / `revise_python_analysis` 不重送；設定檔 headers 不能覆寫 host 決定的 org / actor / session header；非 read-only 一律 approval。
+- **Tool call timeout**：fork 原本硬編 3600s；upstream 改為每個 server 的 `timeoutSeconds`（預設 30s）。`scripts/configure-ask-o11y-workflow-tools.py` 已對三個分析 MCP 設 `timeoutSeconds: 3600`；**既有已套用的 settings 需重新 apply 才會生效**。
+- **Prompt / skills**：upstream 0.3.11 起有正式 bundled skills 機制（`pkg/skills/`）。fork 的 `skills/analysis/SKILL.md` 併入 `pkg/plugin/analyst_prompt.md`（維持一律載入，不改為 on-demand skill），並補上 upstream 的 `{{.CurrentTime}}` 區塊。Upstream 的 observability skills（investigating-alerts 等）仍在 load_skill 目錄中，可於 AppConfig 停用。
+- **Subpath**：`uploadClient.ts` / `grafanaFetch.ts` 改用 upstream `utils/subpath` 以支援 `appSubUrl`。
+- Upstream 新增的 OAuth per-user MCP、MCP provisioner、result cache、trace propagation、Redis 併發修正、CVE 修補等全部帶入。
+
+驗證（本機 Go 1.26.6、Node 24）：`go vet` / `go test ./pkg/...` 全過；`tsc --noEmit`、`eslint`（0 errors / 9 既有 deprecation warnings）、Jest 43 suites / 576 tests、`validate:openapi`、webpack production build 全過。未做 live Grafana / MCP / OpenSandbox 驗收。
+
 ## 授權與回退
 
 - 2026-09-12 使用者批准建立 branch、按直接維護 source 的方向重新設計並開始實作。

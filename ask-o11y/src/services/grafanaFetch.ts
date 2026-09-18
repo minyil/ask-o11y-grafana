@@ -1,8 +1,10 @@
+import { withSubpath } from '../utils/subpath';
+
 let sessionRefresh: Promise<boolean> | undefined;
 
 async function refreshGrafanaSession(): Promise<boolean> {
   if (!sessionRefresh) {
-    sessionRefresh = fetch('/api/login/ping', { credentials: 'same-origin' })
+    sessionRefresh = fetch(withSubpath('/api/login/ping'), { credentials: 'same-origin' })
       .then((response) => response.ok)
       .catch(() => false)
       .finally(() => {

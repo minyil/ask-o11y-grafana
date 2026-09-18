@@ -1,11 +1,14 @@
 import { AppEvents } from '@grafana/data';
 import { getAppEvents } from '@grafana/runtime';
 
+import { pluginUrl } from '../utils/subpath';
 import { grafanaFetch } from './grafanaFetch';
 
 export interface AgentRunRequest {
   message: string;
   type?: 'chat' | 'investigation' | 'performance';
+  /** Skill names to explicitly activate for this run (empty = auto). */
+  skills?: string[];
   sessionId?: string;
   model?: 'base' | 'large';
 
@@ -52,9 +55,16 @@ export interface ErrorEvent {
   retryable?: boolean;
 }
 
+/** A skill active for the run, carried by the run_started event. */
+export interface RunStartedSkill {
+  name: string;
+  description: string;
+}
+
 export interface RunStartedEvent {
   runId: string;
   sessionId?: string;
+  skills?: RunStartedSkill[];
 }
 
 export interface MCPUnavailableEvent {
@@ -144,8 +154,8 @@ export interface AgentRunStatus {
   error?: string;
 }
 
-const AGENT_RUN_URL = '/api/plugins/consensys-asko11y-app/resources/api/agent/run';
-const AGENT_RUNS_URL = '/api/plugins/consensys-asko11y-app/resources/api/agent/runs';
+const AGENT_RUN_URL = pluginUrl('/api/agent/run');
+const AGENT_RUNS_URL = pluginUrl('/api/agent/runs');
 
 export const SSE_IDLE_TIMEOUT_MS = 60_000;
 

@@ -1,6 +1,6 @@
 {
   "name": "Ask O11y",
-  "version": "0.3.2",
+  "version": "0.3.16",
   "scripts": {
     "postinstall": "node -e \"const fs=require('fs');const p=require('path');const d=p.join('node_modules','flatted','golang');try{fs.rmSync(d,{recursive:true,force:true});}catch(e){if(e.code!=='ENOENT')throw e;}\"",
     "build": "npm run build:frontend:prod && npm run build:backend:all",
@@ -114,7 +114,7 @@
     "@grafana/ui": "^13.1.1",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "d3-sankey": "^0.12.3",
-    "dompurify": "^3.4.12",
+    "dompurify": "^3.4.13",
     "js-tiktoken": "^1.0.21",
     "marked": "^17.0.6",
     "react": "^18.3.0",
@@ -126,19 +126,68 @@
   },
   "packageManager": "npm@11.5.1",
   "overrides": {
+    "browserslist": "^4.28.7",
     "serialize-javascript": "^7.0.4",
     "immutable": "^5.1.9",
     "@grafana/data": {
       "dompurify": "^3.3.2"
     },
     "lodash-es": "^4.18.1",
-    "js-yaml": "^4.3.0",
+    "js-yaml": "^4.3.2",
     "undici": "^7.28.0",
     "ws": "^8.21.1",
-    "fast-uri": "^3.1.4",
+    "fast-uri": "^3.1.7",
+    "ip-address": "^10.3.1",
+    "nanoid": "^3.3.17",
     "@grafana/llm": {
       "@grafana/data": "$@grafana/data",
       "@grafana/runtime": "$@grafana/runtime"
+    },
+    "react-router-dom-v5-compat": {
+      "react-router": "^6.30.4"
+    },
+    "hono": "^4.12.34",
+    "mermaid": "^11.16.1",
+    "@remix-run/router": "^1.23.3",
+    "istanbul-lib-processinfo": {
+      "uuid": "^11.1.1"
+    },
+    "brace-expansion": "^5.0.9",
+    "glob": {
+      "brace-expansion": "^2.1.2"
+    },
+    "eslint": {
+      "brace-expansion": "^1.1.18"
+    },
+    "@eslint/eslintrc": {
+      "brace-expansion": "^1.1.18"
+    },
+    "@eslint/config-array": {
+      "brace-expansion": "^1.1.18"
+    },
+    "eslint-plugin-react": {
+      "brace-expansion": "^1.1.18"
+    },
+    "fork-ts-checker-webpack-plugin": {
+      "brace-expansion": "^1.1.18"
+    },
+    "@jest/reporters": {
+      "brace-expansion": "^1.1.18"
+    },
+    "jest-config": {
+      "brace-expansion": "^1.1.18"
+    },
+    "jest-runtime": {
+      "brace-expansion": "^1.1.18"
+    },
+    "nyc": {
+      "brace-expansion": "^1.1.18"
+    },
+    "rimraf": {
+      "brace-expansion": "^1.1.18"
+    },
+    "test-exclude": {
+      "brace-expansion": "^1.1.18"
     }
   }
 }

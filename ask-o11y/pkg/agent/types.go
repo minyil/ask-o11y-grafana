@@ -35,11 +35,19 @@ type OpenAIFunction struct {
 }
 
 type ChatCompletionRequest struct {
-	Model     string       `json:"model,omitempty"`
-	Messages  []Message    `json:"messages"`
-	Tools     []OpenAITool `json:"tools,omitempty"`
-	Stream    bool         `json:"stream,omitempty"`
-	MaxTokens int          `json:"max_tokens,omitempty"`
+	Model         string         `json:"model,omitempty"`
+	Messages      []Message      `json:"messages"`
+	Tools         []OpenAITool   `json:"tools,omitempty"`
+	Stream        bool           `json:"stream,omitempty"`
+	StreamOptions *StreamOptions `json:"stream_options,omitempty"`
+	MaxTokens     int            `json:"max_tokens,omitempty"`
+}
+
+// StreamOptions.IncludeUsage requests a final usage-bearing chunk on an
+// OpenAI-compatible streaming response — without it, providers omit token
+// counts entirely from the stream.
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type ChatCompletionResponse struct {
@@ -131,8 +139,20 @@ type MCPUnavailableEvent struct {
 	Message string `json:"message"`
 }
 
+type ModelUsage struct {
+	Model            string `json:"model"`            // "base" | "large"
+	PromptTokens     int    `json:"promptTokens"`     // Input Tokens
+	CompletionTokens int    `json:"completionTokens"` // Output Tokens
+	TotalTokens      int    `json:"totalTokens"`
+}
+
 type DoneEvent struct {
-	TotalIterations int `json:"totalIterations"`
+	TotalIterations  int                    `json:"totalIterations"`
+	PromptTokens     int64                  `json:"promptTokens"`
+	CompletionTokens int64                  `json:"completionTokens"`
+	TotalTokens      int64                  `json:"totalTokens"`
+	ToolCallCount    int                    `json:"toolCallCount"`
+	UsageByModel     map[string]ModelUsage `json:"usageByModel,omitempty"`
 }
 
 type ErrorEvent struct {
@@ -144,17 +164,38 @@ type ErrorEvent struct {
 }
 
 type RunRequest struct {
-	Message    string `json:"message"`
-	Type       string `json:"type,omitempty"`
-	SessionID  string `json:"sessionId,omitempty"`
-	OrgName    string `json:"orgName,omitempty"`
-	ScopeOrgID string `json:"scopeOrgId,omitempty"`
+	Message    string   `json:"message"`
+	Type       string   `json:"type,omitempty"`
+	Skills     []string `json:"skills,omitempty"`
+	SessionID  string   `json:"sessionId,omitempty"`
+	OrgName    string   `json:"orgName,omitempty"`
+	ScopeOrgID string   `json:"scopeOrgId,omitempty"`
+}
+
+// RunStartedSkill is one skill active for the run, surfaced in the
+// run_started event so the UI can show skill chips on the message.
+type RunStartedSkill struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
 type RunStartedEvent struct {
-	RunID     string `json:"runId"`
-	SessionID string `json:"sessionId,omitempty"`
+	RunID     string            `json:"runId"`
+	SessionID string            `json:"sessionId,omitempty"`
+	Skills    []RunStartedSkill `json:"skills,omitempty"`
 }
+
+// SkillSpec is one catalog entry advertised to the model through the
+// load_skill tool description and the system prompt's Available skills
+// section (progressive-disclosure level 1: metadata only).
+type SkillSpec struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// SkillLoader loads a skill's instructions (or one of its reference files)
+// for the internal load_skill tool. Implemented over the skills registry.
+type SkillLoader func(ctx context.Context, skill, file string) (string, error)
 
 func MarshalSSE(event SSEEvent) ([]byte, error) {
 	data, err := json.Marshal(event)

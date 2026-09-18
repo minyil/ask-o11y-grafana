@@ -11,6 +11,12 @@ import (
 
 const artifactBridgeResolveTool = "artifact-bridge_resolve_dashboard_refs"
 
+// toolContext carries the acting user and chat session into MCP calls so the
+// client forwards them as host-owned headers.
+func (req LoopRequest) toolContext(ctx context.Context) context.Context {
+	return mcp.WithSessionID(mcp.WithUserID(ctx, req.UserID), req.SessionID)
+}
+
 // Reuse opaque bindings: the model supplies layout/references, not figure arrays.
 func (a *AgentLoop) resolveDashboardBindings(ctx context.Context, args map[string]interface{}, req LoopRequest) error {
 	encoded, err := json.Marshal(args)
@@ -31,9 +37,9 @@ func (a *AgentLoop) resolveDashboardBindings(ctx context.Context, args map[strin
 	if !mcp.IsToolEnabled(artifactBridgeResolveTool, req.MCPServers) {
 		return fmt.Errorf("artifact bridge is disabled")
 	}
-	result, err := a.mcpProxy.CallToolForRequest(ctx, artifactBridgeResolveTool,
+	result, err := a.mcpProxy.CallToolWithContext(req.toolContext(ctx), artifactBridgeResolveTool,
 		map[string]interface{}{"dashboard": dashboard, "_server_session_id": req.SessionID},
-		req.OrgID, req.OrgName, req.ScopeOrgID, req.UserID)
+		req.OrgID, req.OrgName, req.ScopeOrgID)
 	if err != nil || result == nil || result.IsError {
 		return fmt.Errorf("artifact binding resolution failed; no dashboard was written")
 	}

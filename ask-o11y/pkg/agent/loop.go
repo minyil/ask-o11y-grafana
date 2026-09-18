@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -31,6 +32,21 @@ const nearLimitWarning = "[SYSTEM: You are approaching the iteration limit. Prod
 // model to reissue a tool call whose arguments arrived truncated/invalid. Beyond
 // this the run ends with a clean, retryable error instead of spinning.
 const maxTruncationRetries = 1
+
+// loadSkillToolName is the internal (non-MCP) tool the loop advertises when
+// a skill catalog is available. It is intercepted before MCP dispatch and
+// never reaches the proxy — loading instructions is read-only and
+// role-agnostic, so it bypasses RBAC by design.
+const loadSkillToolName = "load_skill"
+
+// Eviction-summary tunables: evictStaleToolResults calls out to the cheap
+// "base" model once per stale tool result to compress it before dropping the
+// raw content — see summarizeForEviction.
+const evictionSummaryMaxTokens = 200
+const evictionSummaryMaxInputChars = 20000
+const evictionSummaryFallbackChars = 300
+
+const evictionSummarySystemPrompt = "Summarize the following observability tool result in 2-3 concise sentences for later reference during an ongoing investigation. Preserve concrete facts: numbers, identifiers, timestamps, error messages, and anomalies. Do not add commentary or speculation."
 
 // truncatedToolCallNudge is injected after a truncated tool call is discarded so
 // the model reissues a smaller, complete call rather than repeating the cutoff.
@@ -61,12 +77,34 @@ type LoopRequest struct {
 	AllowModelFallback bool
 	ConversationType   string
 
+	// ContextLimits carries the admin-configurable context-window knobs (trim
+	// caps, eviction threshold, eviction summarization on/off). Zero value
+	// resolves to the historical defaults inside Run.
+	ContextLimits ContextLimits
+
+	// RunID/SessionID identify the run for the run_started SSE event (which
+	// carries the active-skill metadata for the UI). Empty RunID (internal
+	// Scout/discovery runs) suppresses the event.
+	RunID             string
+	SessionID         string
+	ActiveSkillsEvent []RunStartedSkill
+
+	// AvailableSkills is the load_skill catalog: enabled public skills that
+	// were not force-activated. When non-empty (and LoadSkill is set) the
+	// loop advertises the internal load_skill tool so the model can pull a
+	// skill's instructions on demand.
+	AvailableSkills []SkillSpec
+	LoadSkill       SkillLoader
+
 	GrafanaURL string
 	AuthToken  string
 
-	UserRole        string
-	UserID          string
-	SessionID       string
+	UserRole string
+	// UserID identifies the Grafana user running this loop. Carried into MCP
+	// tool-call contexts so OAuth-enabled servers use that user's token and
+	// analysis servers receive the actor behind the service identity.
+	// SessionID above is also forwarded so those servers scope artifacts to it.
+	UserID          int64
 	UploadDatasetID string
 	OrgID           string
 	OrgName         string
@@ -97,10 +135,11 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 	if maxTokens <= 0 {
 		maxTokens = DefaultMaxTotalTokens
 	}
+	limits := req.ContextLimits.withDefaults()
 	completionBudget := completionTokenBudget(maxTokens)
 	promptBudget := maxTokens - completionBudget
 
-	mcpTools, err := a.mcpProxy.ListTools()
+	mcpTools, err := a.mcpProxy.ListToolsWithContext(mcp.WithUserID(ctx, req.UserID))
 	if err != nil {
 		a.logger.Error("Failed to list MCP tools, proceeding without tools", "error", err)
 		mcpTools = []mcp.Tool{}
@@ -121,12 +160,26 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 		mcpTools = filtered
 	}
 	openAITools := ConvertMCPToolsToOpenAI(mcpTools)
+	if len(req.AvailableSkills) > 0 && req.LoadSkill != nil {
+		openAITools = append(openAITools, loadSkillToolSpec(req.AvailableSkills))
+	}
 
 	systemPrompt := req.SystemPrompt
 	if req.UploadDatasetID != "" {
 		systemPrompt += "\n\nCurrent session attachment dataset_id: " + req.UploadDatasetID
 	}
 	messages := BuildContextWindow(systemPrompt, req.Messages, req.Summary, req.RecentMessageCount)
+
+	if req.RunID != "" {
+		a.send(ctx, eventCh, SSEEvent{
+			Type: "run_started",
+			Data: RunStartedEvent{
+				RunID:     req.RunID,
+				SessionID: req.SessionID,
+				Skills:    req.ActiveSkillsEvent,
+			},
+		})
+	}
 
 	// Per-run state for transport-failure aggregation. We emit at most one
 	// mcp_unavailable event per run, once at least 2 distinct tools have hit
@@ -137,12 +190,55 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 	truncationRetries := 0
 	pendingTruncationNudge := false
 
+	// Run-level usage/tool-call totals, surfaced on the "done" event so the
+	// caller can persist per-session stats (tokens, turns, tool calls).
+	// usageMu guards it: eviction summaries now run in background goroutines
+	// (see pendingSummaries below) that write into it concurrently with the
+	// main loop's own writes after each LLM call.
+	usageByModel := make(map[string]ModelUsage)
+	var usageMu sync.Mutex
+	toolCallCount := 0
+
+	// toolResultIsError records which tool_call ids produced an error result,
+	// so evictStaleToolResults can skip LLM summarization for them — error
+	// content is short, deterministic diagnostic text (including the
+	// anti-hallucination directive on transport failures) that must never be
+	// paraphrased.
+	toolResultIsError := make(map[string]bool)
+
+	// pendingSummaries holds eviction summaries kicked off in the background
+	// as soon as each tool result is appended (see the tool-call loop below),
+	// keyed by tool_call id. A result typically doesn't go stale for several
+	// iterations (DefaultKeepRecentToolResults=8 tool calls later), so by the time
+	// evictStaleToolResults actually needs the summary it has almost always
+	// already finished — turning what used to be a blocking "base" model call
+	// on the hot path into a wait that resolves instantly. Only ever read and
+	// deleted from the main loop goroutine, so it needs no lock of its own.
+	pendingSummaries := make(map[string]*toolResultSummaryFuture)
+
 	for iteration := 0; iteration < maxIter; iteration++ {
 		if ctx.Err() != nil {
 			return
 		}
 
-		messages = TrimMessagesToTokenLimit(messages, openAITools, promptBudget)
+		messages = evictStaleToolResults(messages, limits.KeepRecentToolResults, func(toolCallID, toolName, content string) string {
+			if limits.ToolCallSummarizationDisabled {
+				// Admin disabled eviction summaries: fall back to a plain
+				// truncation of the raw content, no LLM call.
+				return truncateWhitespace(content, evictionSummaryFallbackChars)
+			}
+			if future, ok := pendingSummaries[toolCallID]; ok {
+				delete(pendingSummaries, toolCallID)
+				return future.wait(ctx)
+			}
+			// No background future found (shouldn't normally happen since every
+			// non-error tool result starts one on append) — fall back to a
+			// synchronous summary so eviction still completes correctly.
+			return a.summarizeForEviction(ctx, req, usageByModel, &usageMu, toolName, content)
+		}, func(toolCallID string) bool {
+			return toolResultIsError[toolCallID]
+		})
+		messages = TrimMessagesToTokenLimit(messages, openAITools, promptBudget, limits)
 
 		a.logger.Debug("Agent loop iteration",
 			"iteration", iteration,
@@ -172,7 +268,7 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 			Tools:     openAITools,
 			MaxTokens: completionBudget,
 		}
-		resp, err := a.chatCompletionWithFallback(ctx, llmReq, req)
+		resp, effectiveModel, err := a.chatCompletionWithFallback(ctx, llmReq, req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -182,6 +278,17 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 				Data: llmErrorEvent(err),
 			})
 			return
+		}
+
+		if resp.Usage != nil {
+			usageMu.Lock()
+			usage := usageByModel[effectiveModel]
+			usage.Model = effectiveModel
+			usage.PromptTokens += resp.Usage.PromptTokens
+			usage.CompletionTokens += resp.Usage.CompletionTokens
+			usage.TotalTokens += resp.Usage.TotalTokens
+			usageByModel[effectiveModel] = usage
+			usageMu.Unlock()
 		}
 
 		msg := resp.Choices[0].Message
@@ -245,9 +352,33 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 					Data: ContentEvent{Content: msg.Content},
 				})
 			}
+			// Snapshot into a fresh map under the lock: background eviction-summary
+			// goroutines for tool results still within DefaultKeepRecentToolResults (never
+			// evicted before the run ended) may still be writing to usageByModel
+			// after this point. DoneEvent crosses into another goroutine over
+			// eventCh, so handing out the live map risks a concurrent read/write
+			// (and, for callers that marshal it to JSON, a fatal concurrent map
+			// access) — the copy is the only value anything ever reads again.
+			usageMu.Lock()
+			usageSnapshot := make(map[string]ModelUsage, len(usageByModel))
+			var promptTokens, completionTokens, totalTokens int64
+			for model, u := range usageByModel {
+				usageSnapshot[model] = u
+				promptTokens += int64(u.PromptTokens)
+				completionTokens += int64(u.CompletionTokens)
+				totalTokens += int64(u.TotalTokens)
+			}
+			usageMu.Unlock()
 			a.send(ctx, eventCh, SSEEvent{
 				Type: "done",
-				Data: DoneEvent{TotalIterations: iteration + 1},
+				Data: DoneEvent{
+					TotalIterations:  iteration + 1,
+					PromptTokens:     promptTokens,
+					CompletionTokens: completionTokens,
+					TotalTokens:      totalTokens,
+					ToolCallCount:    toolCallCount,
+					UsageByModel:     usageSnapshot,
+				},
 			})
 			return
 		}
@@ -259,6 +390,7 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 			if ctx.Err() != nil {
 				return
 			}
+			toolCallCount++
 
 			a.send(ctx, eventCh, SSEEvent{
 				Type: "tool_call_start",
@@ -269,7 +401,14 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 				},
 			})
 
-			toolContent, isError, errorKind := a.executeToolWithApproval(ctx, eventCh, tc, req)
+			var toolContent string
+			var isError bool
+			var errorKind string
+			if tc.Function.Name == loadSkillToolName && req.LoadSkill != nil {
+				toolContent, isError, errorKind = a.executeLoadSkill(ctx, tc, req)
+			} else {
+				toolContent, isError, errorKind = a.executeToolWithApproval(ctx, eventCh, tc, req)
+			}
 
 			a.send(ctx, eventCh, SSEEvent{
 				Type: "tool_call_result",
@@ -296,6 +435,20 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 				ToolCallID: tc.ID,
 				Content:    llmContent,
 			})
+			toolResultIsError[tc.ID] = isError
+
+			// Kick off this result's eviction summary now, in the background,
+			// instead of waiting until it's actually stale. Error results are
+			// never LLM-summarized (see evictStaleToolResults), so skip them;
+			// likewise when the admin disabled eviction summaries.
+			if !isError && !limits.ToolCallSummarizationDisabled {
+				future := newToolResultSummaryFuture()
+				pendingSummaries[tc.ID] = future
+				toolName, toolResultContent := tc.Function.Name, toolContent
+				go func() {
+					future.resolve(a.summarizeForEviction(ctx, req, usageByModel, &usageMu, toolName, toolResultContent))
+				}()
+			}
 
 			if !mcpUnavailableEmitted && len(transportFailedTools) >= 2 {
 				mcpUnavailableEmitted = true
@@ -306,7 +459,7 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 					},
 				})
 			}
-			if !isError {
+			if !isError && tc.Function.Name != loadSkillToolName {
 				a.send(ctx, eventCh, SSEEvent{
 					Type: "evidence",
 					Data: EvidenceEvent{
@@ -328,15 +481,103 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 	})
 }
 
-func (a *AgentLoop) chatCompletionWithFallback(ctx context.Context, llmReq ChatCompletionRequest, req LoopRequest) (*ChatCompletionResponse, error) {
+// toolResultSummaryFuture carries the result of a summarizeForEviction call
+// started in the background as soon as a tool result is appended to history.
+// wait blocks until the goroutine resolves it (or ctx is cancelled) — in
+// steady state this is a no-op because DefaultKeepRecentToolResults gives the
+// summary several iterations' worth of head start before it's actually needed.
+type toolResultSummaryFuture struct {
+	done   chan struct{}
+	result string
+}
+
+func newToolResultSummaryFuture() *toolResultSummaryFuture {
+	return &toolResultSummaryFuture{done: make(chan struct{})}
+}
+
+func (f *toolResultSummaryFuture) resolve(result string) {
+	f.result = result
+	close(f.done)
+}
+
+func (f *toolResultSummaryFuture) wait(ctx context.Context) string {
+	select {
+	case <-f.done:
+		return f.result
+	case <-ctx.Done():
+		return ""
+	}
+}
+
+// summarizeForEviction condenses a stale tool result with a cheap ("base")
+// model call before evictStaleToolResults drops the raw content, so the model
+// keeps the gist of earlier evidence instead of nothing. Any failure (network
+// error, empty response, exhausted quota) falls back to a plain whitespace
+// truncation of the original content rather than surfacing an error — this is
+// a cost optimization on top of an already-working eviction path, not a
+// critical request, so degrading quietly is preferable to failing the run.
+// usageMu guards usageByModel: this now runs concurrently from a background
+// goroutine per tool result (see the Run loop) as well as, in the fallback
+// path, the main loop goroutine itself.
+func (a *AgentLoop) summarizeForEviction(ctx context.Context, req LoopRequest, usageByModel map[string]ModelUsage, usageMu *sync.Mutex, toolName, content string) string {
+	fallback := truncateWhitespace(content, evictionSummaryFallbackChars)
+
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return fallback
+	}
+	if len(trimmed) > evictionSummaryMaxInputChars {
+		trimmed = trimmed[:evictionSummaryMaxInputChars]
+	}
+
+	resp, err := a.llmClient.ChatCompletion(ctx, ChatCompletionRequest{
+		Model: "base",
+		Messages: []Message{
+			{Role: "system", Content: evictionSummarySystemPrompt},
+			{Role: "user", Content: fmt.Sprintf("Tool: %s\n\nResult:\n%s", toolName, trimmed)},
+		},
+		MaxTokens: evictionSummaryMaxTokens,
+	}, req.GrafanaURL, req.AuthToken, req.OrgID)
+	if err != nil {
+		a.logger.Warn("Tool result eviction summary failed, falling back to truncation", "error", err, "tool", toolName)
+		return fallback
+	}
+
+	if resp.Usage != nil {
+		usageMu.Lock()
+		usage := usageByModel["base"]
+		usage.Model = "base"
+		usage.PromptTokens += resp.Usage.PromptTokens
+		usage.CompletionTokens += resp.Usage.CompletionTokens
+		usage.TotalTokens += resp.Usage.TotalTokens
+		usageByModel["base"] = usage
+		usageMu.Unlock()
+	}
+
+	if len(resp.Choices) == 0 {
+		return fallback
+	}
+	summary := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if summary == "" {
+		return fallback
+	}
+	return summary
+}
+
+func (a *AgentLoop) chatCompletionWithFallback(ctx context.Context, llmReq ChatCompletionRequest, req LoopRequest) (*ChatCompletionResponse, string, error) {
+	effectiveModel := llmReq.Model
+	if effectiveModel == "" {
+		effectiveModel = "base"
+	}
+
 	resp, err := a.llmClient.ChatCompletion(ctx, llmReq, req.GrafanaURL, req.AuthToken, req.OrgID)
 	if err == nil {
-		return resp, nil
+		return resp, effectiveModel, nil
 	}
 
 	var llmErr *LLMHTTPError
 	if !req.AllowModelFallback || llmReq.Model != "large" || !errors.As(err, &llmErr) || llmErr.StatusCode < 500 {
-		return nil, err
+		return nil, effectiveModel, err
 	}
 
 	fallbackReq := llmReq
@@ -350,11 +591,11 @@ func (a *AgentLoop) chatCompletionWithFallback(ctx context.Context, llmReq ChatC
 	resp, fallbackErr := a.llmClient.ChatCompletion(ctx, fallbackReq, req.GrafanaURL, req.AuthToken, req.OrgID)
 	if fallbackErr != nil {
 		a.logger.Warn("LLM base fallback failed", "error", fallbackErr)
-		return nil, fallbackErr
+		return nil, "base", fallbackErr
 	}
 
 	a.logger.Info("LLM base fallback succeeded after large model failure", "requestId", llmErr.RequestID)
-	return resp, nil
+	return resp, "base", nil
 }
 
 func llmErrorEvent(err error) ErrorEvent {
@@ -439,7 +680,7 @@ func (a *AgentLoop) executeTool(ctx context.Context, tc ToolCall, req LoopReques
 	}
 	mcp.EnsureScopedGraphitiArgs(tool, args, req.OrgID)
 
-	result, err := a.mcpProxy.CallToolForRequest(ctx, tc.Function.Name, args, req.OrgID, req.OrgName, req.ScopeOrgID, req.UserID)
+	result, err := a.mcpProxy.CallToolWithContext(req.toolContext(ctx), tc.Function.Name, args, req.OrgID, req.OrgName, req.ScopeOrgID)
 	if err != nil {
 		a.logger.Error("Tool call failed", "tool", tc.Function.Name, "error", err)
 		var te *mcp.TransportError
@@ -543,6 +784,58 @@ func (a *AgentLoop) executeToolWithApproval(ctx context.Context, eventCh chan<- 
 	}
 
 	return a.executeTool(ctx, tc, req)
+}
+
+// executeLoadSkill serves the internal load_skill tool: it pulls a skill's
+// instructions (or one of its reference files) from the registry. Errors are
+// returned as tool errors for the model to react to.
+func (a *AgentLoop) executeLoadSkill(ctx context.Context, tc ToolCall, req LoopRequest) (content string, isError bool, errorKind string) {
+	var args struct {
+		Skill string `json:"skill"`
+		File  string `json:"file,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+		return fmt.Sprintf("Invalid load_skill arguments: %v", err), true, "tool"
+	}
+	if args.Skill == "" {
+		return "load_skill requires a 'skill' argument", true, "tool"
+	}
+	loaded, err := req.LoadSkill(ctx, args.Skill, args.File)
+	if err != nil {
+		return fmt.Sprintf("load_skill failed: %v", err), true, "tool"
+	}
+	return loaded, false, ""
+}
+
+// loadSkillToolSpec builds the OpenAI tool definition for load_skill. The
+// description names the catalog so the model can match the task to a skill
+// without loading any body up front (progressive disclosure level 1).
+func loadSkillToolSpec(specs []SkillSpec) OpenAITool {
+	names := make([]string, 0, len(specs))
+	for _, s := range specs {
+		names = append(names, s.Name)
+	}
+	return OpenAITool{
+		Type: "function",
+		Function: OpenAIFunction{
+			Name:        loadSkillToolName,
+			Description: "Loads an agent skill's specialized instructions into the conversation. Call this before proceeding when the task matches one of the available skills. Available skills: " + strings.Join(names, ", "),
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"skill": map[string]interface{}{
+						"type":        "string",
+						"description": "Name of the skill to load, from the available skills list",
+					},
+					"file": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional reference file inside the skill (e.g. references/logql.md); omit to load the skill's main instructions",
+					},
+				},
+				"required": []string{"skill"},
+			},
+		},
+	}
 }
 
 func approvalPolicyEnabled(policy string) bool {

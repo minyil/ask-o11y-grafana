@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"consensys-asko11y-app/pkg/mcp"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
@@ -43,7 +44,7 @@ func TestHandleUploadProxiesOwnedSession(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	store := NewSessionStore(log.DefaultLogger)
+	store := NewSessionStore(log.DefaultLogger, time.Hour)
 	session, err := store.CreateSession(7, 1, "upload", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +93,7 @@ func TestHandleUploadProxiesOwnedSession(t *testing.T) {
 }
 
 func TestHandleUploadRejectsUnownedAndOversized(t *testing.T) {
-	store := NewSessionStore(log.DefaultLogger)
+	store := NewSessionStore(log.DefaultLogger, time.Hour)
 	session, err := store.CreateSession(8, 1, "foreign", nil)
 	if err != nil {
 		t.Fatal(err)

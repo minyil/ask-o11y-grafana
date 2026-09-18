@@ -5,6 +5,137 @@ All notable changes to the Ask O11y Grafana plugin will be documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.16](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.15...v0.3.16) (2026-09-11)
+
+
+### Bug Fixes
+
+* make Redis rate-limit TTL atomic ([#217](https://github.com/Consensys/ask-o11y-plugin/issues/217)) ([517a48c](https://github.com/Consensys/ask-o11y-plugin/commit/517a48ccf1374f44d7636d472bf18aa0d063f383))
+* preserve concurrent Redis session writes ([#218](https://github.com/Consensys/ask-o11y-plugin/issues/218)) ([6330f3f](https://github.com/Consensys/ask-o11y-plugin/commit/6330f3f1401be1c0f843a7816f83b5cb7ead069f))
+* **skills:** use embed.FS methods instead of io/fs package calls ([#220](https://github.com/Consensys/ask-o11y-plugin/issues/220)) ([be34f87](https://github.com/Consensys/ask-o11y-plugin/commit/be34f8707a53db3d8e9d81c27ca433d9fb6ec46d))
+
+## [0.3.15](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.14...v0.3.15) (2026-09-09)
+
+
+### Features
+
+* **config:** admin-configurable context-window management ([#216](https://github.com/Consensys/ask-o11y-plugin/issues/216)) ([0b52a34](https://github.com/Consensys/ask-o11y-plugin/commit/0b52a34bb4da2a3ab1154a4e2be6e78a95892098))
+
+## [0.3.14](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.13...v0.3.14) (2026-09-08)
+
+
+### Bug Fixes
+
+* **mcp:** keep the sdk tracing middleware mid-chain via context enrichment ([#214](https://github.com/Consensys/ask-o11y-plugin/issues/214)) ([89b9a6a](https://github.com/Consensys/ask-o11y-plugin/commit/89b9a6afdce72e3e728ec13e4c6dbb2804ca915f))
+
+## [0.3.13](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.12...v0.3.13) (2026-09-08)
+
+
+### Features
+
+* **mcp:** propagate W3C trace context on outgoing MCP requests ([8c5de3b](https://github.com/Consensys/ask-o11y-plugin/commit/8c5de3b8f1014b5e072071b2ebd971e4958bb597))
+* **mcp:** propagate W3C trace context on outgoing MCP requests ([#212](https://github.com/Consensys/ask-o11y-plugin/issues/212)) ([033b883](https://github.com/Consensys/ask-o11y-plugin/commit/033b8836d6d3afd37bf76f68d32ad6b30bd26382))
+
+## [0.3.12](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.11...v0.3.12) (2026-09-08)
+
+
+### Performance Improvements
+
+* **mcp:** configurable tool-call budget, inject current time, drop time & sequential-thinking tools ([#209](https://github.com/Consensys/ask-o11y-plugin/issues/209)) ([e61f8ac](https://github.com/Consensys/ask-o11y-plugin/commit/e61f8ac0933bf785f2fdf558c32f759a598007e7))
+
+## [0.3.11](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.10...v0.3.11) (2026-09-07)
+
+
+### Features
+
+* skills ([#206](https://github.com/Consensys/ask-o11y-plugin/issues/206)) ([d098a99](https://github.com/Consensys/ask-o11y-plugin/commit/d098a99a625ddcf74cea065302b7d703a26a29f2))
+
+
+### Bug Fixes
+
+* **backend:** fail agent runs abandoned by a dead replica ([#203](https://github.com/Consensys/ask-o11y-plugin/issues/203)) ([daff5d1](https://github.com/Consensys/ask-o11y-plugin/commit/daff5d131d8f4996a8742e29d4bc95c31417d715))
+* **backend:** fan out agent run events over redis pub/sub ([#202](https://github.com/Consensys/ask-o11y-plugin/issues/202)) ([4c92d98](https://github.com/Consensys/ask-o11y-plugin/commit/4c92d98546c39d89e7bfa9246a7a52dcd5d89951))
+* **mcp:** build graphiti from source, drop unused provider extras (6.4GB -&gt; 218MB) ([#201](https://github.com/Consensys/ask-o11y-plugin/issues/201)) ([63493ee](https://github.com/Consensys/ask-o11y-plugin/commit/63493eef5184f693146f9c34905c67864ded936b))
+* **mcp:** route local Graphiti through litellm, drop Ollama, fix config substitution ([#200](https://github.com/Consensys/ask-o11y-plugin/issues/200)) ([5646abc](https://github.com/Consensys/ask-o11y-plugin/commit/5646abc9e5981fd72e38cb429ce9264b3ea48f86))
+
+## [0.3.10](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.9...v0.3.10) (2026-09-04)
+
+
+### Features
+
+* **mcp:** pin graphiti image, add community detection, auto-save, and retention TTLs ([#198](https://github.com/Consensys/ask-o11y-plugin/issues/198)) ([8ce432a](https://github.com/Consensys/ask-o11y-plugin/commit/8ce432a9a4cb9820868936abcd8eba76f9fc3ed5))
+
+
+### Bug Fixes
+
+* **doc:** add gcx guide ([#197](https://github.com/Consensys/ask-o11y-plugin/issues/197)) ([b115e8c](https://github.com/Consensys/ask-o11y-plugin/commit/b115e8ccd35b897966ad62ee7c40eee257e1fab0))
+
+## [0.3.9](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.8...v0.3.9) (2026-09-01)
+
+
+### Bug Fixes
+
+* **deps:** override browserslist to patch CVE-2026-73088 and CVE-2026-73089 ([#193](https://github.com/Consensys/ask-o11y-plugin/issues/193)) ([8eafe1e](https://github.com/Consensys/ask-o11y-plugin/commit/8eafe1e830ca2a8476facd3c54ddb4fb02f16430))
+
+## [0.3.8](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.7...v0.3.8) (2026-09-01)
+
+
+### Bug Fixes
+
+* **backend:** speed up alert-investigation runs (guardrails, async eviction, token accounting, metric-catalog caching) ([#191](https://github.com/Consensys/ask-o11y-plugin/issues/191)) ([a3da53e](https://github.com/Consensys/ask-o11y-plugin/commit/a3da53ef79b1af63bae6d0a56815a67d78e08ab2))
+
+## [0.3.7](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.6...v0.3.7) (2026-08-31)
+
+
+### Features
+
+* **mcp:** per-user OAuth for external MCP servers ([#187](https://github.com/Consensys/ask-o11y-plugin/issues/187)) ([fbfcf9d](https://github.com/Consensys/ask-o11y-plugin/commit/fbfcf9da2be98207997ba228e7db3121e520ff48))
+
+
+### Bug Fixes
+
+* **backend:** cut agent loop token cost via context eviction and lower ceiling ([#189](https://github.com/Consensys/ask-o11y-plugin/issues/189)) ([974cac3](https://github.com/Consensys/ask-o11y-plugin/commit/974cac3eb1d81ccfeaaf3f59b7dbadcc308036fc))
+
+## [0.3.6](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.5...v0.3.6) (2026-08-19)
+
+
+### Bug Fixes
+
+* **backend:** bump Go toolchain to 1.26.6, suppress gosec G404 false positive ([#186](https://github.com/Consensys/ask-o11y-plugin/issues/186)) ([1cea5de](https://github.com/Consensys/ask-o11y-plugin/commit/1cea5de012ffc56a0a38895c59377651006d1e86))
+
+## [0.3.5](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.4...v0.3.5) (2026-08-19)
+
+
+### Bug Fixes
+
+* **deps:** correct metrics scrape endpoint, add privacy note, patch npm CVEs ([#183](https://github.com/Consensys/ask-o11y-plugin/issues/183)) ([e779007](https://github.com/Consensys/ask-o11y-plugin/commit/e779007c7cd35958e669e64baf01d1c144827e3f))
+* **mcp:** encode binary content blocks ([#171](https://github.com/Consensys/ask-o11y-plugin/issues/171)) ([bdf6cb6](https://github.com/Consensys/ask-o11y-plugin/commit/bdf6cb69ebc2f583f528d601d7f21b68038c45c1))
+
+## [0.3.4](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.3...v0.3.4) (2026-08-13)
+
+
+### Features
+
+* add per-user token metrics endpoint and chat message token footer ([#180](https://github.com/Consensys/ask-o11y-plugin/issues/180)) ([abe300b](https://github.com/Consensys/ask-o11y-plugin/commit/abe300b35f98a09a15b754623f0f95e690fc327e))
+
+
+### Bug Fixes
+
+* **chat:** improve session sidebar stats readability ([#181](https://github.com/Consensys/ask-o11y-plugin/issues/181)) ([26489ff](https://github.com/Consensys/ask-o11y-plugin/commit/26489ffbecd88808b80051c8da500b456fe3757d))
+
+## [0.3.3](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.2...v0.3.3) (2026-08-11)
+
+
+### Features
+
+* **frontend:** support Grafana subpath deployments ([#175](https://github.com/Consensys/ask-o11y-plugin/issues/175)) ([cd3e739](https://github.com/Consensys/ask-o11y-plugin/commit/cd3e739b4d67d000cb5a021223651d7809a1e451))
+* **session:** add per-session usage stats endpoint ([#176](https://github.com/Consensys/ask-o11y-plugin/issues/176)) ([b8d6871](https://github.com/Consensys/ask-o11y-plugin/commit/b8d68715083e4228868dc55730c9a66c3ea74abf))
+
+
+### Bug Fixes
+
+* **share:** apply Grafana subpath prefix to buildShareUrl() ([#178](https://github.com/Consensys/ask-o11y-plugin/issues/178)) ([34812eb](https://github.com/Consensys/ask-o11y-plugin/commit/34812eb536c231bb47878cc1fb3fb6a49ffca91e))
+
 ## [0.3.2](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.1...v0.3.2) (2026-08-03)
 
 
