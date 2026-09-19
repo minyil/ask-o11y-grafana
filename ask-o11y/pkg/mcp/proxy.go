@@ -75,9 +75,13 @@ func (p *Proxy) UpdateConfig(configs []ServerConfig) error {
 		}
 	}
 
-	sdkHTTPClient, err := p.sdkClient()
-	if err != nil {
-		return fmt.Errorf("failed to create SDK HTTP client: %w", err)
+	sdkHTTPClients := make(map[string]*http.Client, len(newConfigs))
+	for id, config := range newConfigs {
+		sdkHTTPClient, err := p.sdkClient(config)
+		if err != nil {
+			return fmt.Errorf("failed to create SDK HTTP client: %w", err)
+		}
+		sdkHTTPClients[id] = sdkHTTPClient
 	}
 
 	// Collect stale clients under lock, then close outside the lock
@@ -94,7 +98,7 @@ func (p *Proxy) UpdateConfig(configs []ServerConfig) error {
 	}
 	for id, config := range newConfigs {
 		if _, exists := p.clients[id]; !exists {
-			c := NewClient(p.ctx, config, p.logger, sdkHTTPClient)
+			c := NewClient(p.ctx, config, p.logger, sdkHTTPClients[id])
 			if p.perUserToken != nil {
 				c.SetPerUserTokenProvider(p.perUserToken)
 			}
@@ -191,7 +195,7 @@ func (p *Proxy) NewStandaloneClient(id string) (*Client, bool) {
 		return nil, false
 	}
 
-	sdkHTTPClient, err := p.sdkClient()
+	sdkHTTPClient, err := p.sdkClient(existing.config)
 	if err != nil {
 		return nil, false
 	}
@@ -377,7 +381,7 @@ func (p *Proxy) Close() {
 }
 
 func (p *Proxy) EnsureServer(config ServerConfig) error {
-	sdkHTTPClient, err := p.sdkClient()
+	sdkHTTPClient, err := p.sdkClient(config)
 	if err != nil {
 		return fmt.Errorf("failed to create SDK HTTP client: %w", err)
 	}
@@ -429,10 +433,14 @@ func (p *Proxy) RemoveServer(id string) {
 	}
 }
 
-func (p *Proxy) sdkClient() (*http.Client, error) {
+// sdkClient builds the SDK HTTP client for one server. The SDK copies
+// Timeouts.Timeout into the transport's ResponseHeaderTimeout, so it must
+// cover that server's whole tool-call budget: a synchronous tool sends no
+// response headers until it has finished.
+func (p *Proxy) sdkClient(config ServerConfig) (*http.Client, error) {
 	return httpclient.New(httpclient.Options{
 		Timeouts: &httpclient.TimeoutOptions{
-			Timeout:     30 * time.Second,
+			Timeout:     toolCallBudget(config),
 			DialTimeout: connectDialTimeout,
 		},
 	})

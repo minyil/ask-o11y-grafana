@@ -275,10 +275,15 @@ const connectDialTimeout = 10 * time.Second
 const defaultToolCallTimeout = 30 * time.Second
 
 // toolCallTimeout resolves the per-call budget: the server's configured
-// timeout when set, the package default otherwise.
+// TimeoutSeconds, or defaultToolCallTimeout when unset.
 func (c *Client) toolCallTimeout() time.Duration {
-	if c.config.TimeoutSeconds > 0 {
-		return time.Duration(c.config.TimeoutSeconds) * time.Second
+	return toolCallBudget(c.config)
+}
+
+// toolCallBudget is the tool-call budget for a server configuration.
+func toolCallBudget(config ServerConfig) time.Duration {
+	if config.TimeoutSeconds > 0 {
+		return time.Duration(config.TimeoutSeconds) * time.Second
 	}
 	return defaultToolCallTimeout
 }

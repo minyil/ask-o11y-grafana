@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -78,4 +79,37 @@ func TestClient_TransportHTTPClientTimeout(t *testing.T) {
 	if got := c.transportHTTPClient(shared); got != shared {
 		t.Fatal("non-MCP transports should get the shared client unchanged")
 	}
+}
+
+// A synchronous MCP tool sends no response headers until it finishes. The
+// SDK copies its Timeout into the transport's ResponseHeaderTimeout, so the
+// SDK client must be built from the server's tool-call budget; otherwise a
+// configured timeoutSeconds above the default is silently ineffective.
+func TestSDKClient_ResponseHeaderTimeoutFollowsServerBudget(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+	p := NewProxy(context.Background(), log.DefaultLogger)
+	defer p.Close()
+
+	short, err := p.sdkClient(ServerConfig{ID: "s", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := short.Get(slow.URL); err == nil {
+		resp.Body.Close()
+		t.Fatal("a 1s budget must time out awaiting headers from a 2s tool")
+	}
+
+	long, err := p.sdkClient(ServerConfig{ID: "l", TimeoutSeconds: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := long.Get(slow.URL)
+	if err != nil {
+		t.Fatalf("a 10s budget must wait for the slow tool's headers: %v", err)
+	}
+	resp.Body.Close()
 }
