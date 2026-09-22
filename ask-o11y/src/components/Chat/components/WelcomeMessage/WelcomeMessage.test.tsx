@@ -24,18 +24,18 @@ jest.mock('@grafana/ui', () => ({
 describe('WelcomeMessage', () => {
   it('should render the welcome greeting', () => {
     render(<WelcomeMessage />);
-    expect(screen.getByText(/Hi, I'm/i)).toBeInTheDocument();
+    expect(screen.getByText('嗨，我是')).toBeInTheDocument();
   });
 
   it('should render the assistant name', () => {
     render(<WelcomeMessage />);
-    expect(screen.getByText('Ask O11y Assistant')).toBeInTheDocument();
+    expect(screen.getByText('數據分析助手')).toBeInTheDocument();
   });
 
   it('should render the description', () => {
     render(<WelcomeMessage />);
-    expect(screen.getByText(/agentic LLM assistant/i)).toBeInTheDocument();
-    expect(screen.getByText(/for Grafana/i)).toBeInTheDocument();
+    expect(screen.getByText('透過自然語言')).toBeInTheDocument();
+    expect(screen.getByText(/查詢數據、分析趨勢/)).toBeInTheDocument();
   });
 
   it('should have proper styling classes', () => {
