@@ -34,13 +34,16 @@ type OpenAIFunction struct {
 	Parameters  map[string]interface{} `json:"parameters,omitempty"`
 }
 
+// MaxCompletionTokens is sent as max_tokens: the deployed grafana-llm-app
+// provider enforces only max_tokens and silently ignores max_completion_tokens
+// for Claude models.
 type ChatCompletionRequest struct {
 	Model               string         `json:"model,omitempty"`
 	Messages            []Message      `json:"messages"`
 	Tools               []OpenAITool   `json:"tools,omitempty"`
 	Stream              bool           `json:"stream,omitempty"`
 	StreamOptions       *StreamOptions `json:"stream_options,omitempty"`
-	MaxCompletionTokens int            `json:"max_completion_tokens,omitempty"`
+	MaxCompletionTokens int            `json:"max_tokens,omitempty"`
 }
 
 // StreamOptions.IncludeUsage requests a final usage-bearing chunk on an

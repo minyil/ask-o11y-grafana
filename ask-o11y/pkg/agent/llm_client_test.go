@@ -114,17 +114,17 @@ func TestLLMClient_ChatCompletion_UsesRequestedModel(t *testing.T) {
 	}
 }
 
-func TestLLMClient_ChatCompletion_UsesMaxCompletionTokens(t *testing.T) {
+func TestLLMClient_ChatCompletion_SendsBudgetAsMaxTokens(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var raw map[string]interface{}
 		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
 		}
-		if got := raw["max_completion_tokens"]; got != float64(2048) {
-			t.Errorf("max_completion_tokens = %v, want 2048", got)
+		if got := raw["max_tokens"]; got != float64(2048) {
+			t.Errorf("max_tokens = %v, want 2048", got)
 		}
-		if _, ok := raw["max_tokens"]; ok {
-			t.Errorf("legacy max_tokens field should be omitted")
+		if _, ok := raw["max_completion_tokens"]; ok {
+			t.Errorf("max_completion_tokens is ignored by the provider and should be omitted")
 		}
 
 		writeSSEChunks(w,
