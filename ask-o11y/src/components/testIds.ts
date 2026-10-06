@@ -82,6 +82,8 @@ export const testIds = {
     activeSkillHint: (name: string) => `data-testid chat-active-skill-${name}`,
     skillChip: (name: string) => `data-testid chat-skill-chip-${name}`,
     openDashboardButton: 'data-testid chat-open-dashboard-button',
+    finalReportCard: 'data-testid chat-final-report-card',
+    finalReportHypothesis: (index: number) => `data-testid chat-final-report-hypothesis-${index}`,
   },
   investigation: {
     error: 'data-testid investigation-error',

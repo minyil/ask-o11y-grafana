@@ -30,6 +30,13 @@ const minCompletionTokens = 512
 // rejected up front; only runs that actually hit the limit pay for more room.
 const defaultCompletionTokenCeiling = 16384
 
+// finalAnswerCompletionTokens is the completion budget used to re-request a
+// final answer that was cut off (finish_reason=length). Reasoning models spend
+// part of the regular budget on hidden thinking tokens, so a long final
+// report with its rca-report block can exhaust 4096 tokens mid-sentence. It is
+// still bounded by the run's completionBudget ceiling (see finalAnswerBudget).
+const finalAnswerCompletionTokens = 16384
+
 // nearLimitWarning is injected as a one-shot system message on the second-to-last
 // iteration to steer the LLM toward a honest final answer instead of fabricating
 // around missing data when the loop is about to abort at maxIter.
@@ -134,6 +141,11 @@ type LoopRequest struct {
 
 	ApprovalPolicy       string
 	MaxParallelToolCalls int
+	// ServiceTopology is the rendered Service Topology snapshot (see
+	// pkg/plugin/topology_snapshot.go); its edges validate the final report's
+	// propagation paths. Empty disables that check.
+	ServiceTopology string
+
 	RegisterApproval     ApprovalRegistrar
 	CheckApprovalGrant   ApprovalGrantChecker
 }
@@ -203,6 +215,20 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 	truncationRetries := 0
 	pendingTruncationNudge := false
 
+	// Repetition/stall guard state (see stall.go): pendingStallNudge is the
+	// one-shot system message queued by the previous batch; stallNudges and
+	// forcedFinal surface on the done event for run traces and session stats.
+	stall := newStallDetector()
+	pendingStallNudge := ""
+	stallNudges := 0
+	forcedFinal := false
+
+	// Structured final report state: the service topology parsed to edges
+	// (nil when none was prefetched), and whether the repair turn is spent.
+	topologyEdges := parseTopologyEdges(req.ServiceTopology)
+	repairUsed := false
+	pendingRepairNudge := ""
+
 	// Run-level usage/tool-call totals, surfaced on the "done" event so the
 	// caller can persist per-session stats (tokens, turns, tool calls).
 	// usageMu guards it: eviction summaries now run in background goroutines
@@ -218,6 +244,36 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 	// anti-hallucination directive on transport failures) that must never be
 	// paraphrased.
 	toolResultIsError := make(map[string]bool)
+	// successfulToolNames records tool names with at least one non-error
+	// result. Models frequently cite the tool name instead of the call id
+	// (observed in production), which is still a grounded claim.
+	successfulToolNames := make(map[string]bool)
+	// evidenceIDs holds the run-local citation ids (e1, e2, ...) shown in the
+	// evidence header of successful tool results.
+	evidenceIDs := make(map[string]bool)
+
+	// evidenceOK grounds final-report evidence claims: an id counts when it
+	// belongs to a tool call that executed and did not error, or names a
+	// tool that returned at least one successful result.
+	evidenceOK := func(id string) bool {
+		id = strings.TrimSpace(id)
+		if isError, known := toolResultIsError[id]; known {
+			return !isError
+		}
+		if evidenceIDs[id] {
+			return true
+		}
+		return successfulToolNames[id]
+	}
+	// lastFinalProse keeps the prose of a final answer sent back for repair,
+	// so a repaired answer that only re-emits the rca-report block still
+	// shows the user the original explanation.
+	lastFinalProse := ""
+	// A final answer truncated by the completion budget is re-requested once
+	// with finalAnswerCompletionTokens instead of being shown half-written.
+	truncatedFinalRetried := false
+	emptyFinalRetried := false
+	boostCompletion := false
 
 	// pendingSummaries holds eviction summaries kicked off in the background
 	// as soon as each tool result is appended (see the tool-call loop below),
@@ -271,30 +327,45 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 			oneShot = append(oneShot, Message{Role: "system", Content: truncatedToolCallNudge})
 			pendingTruncationNudge = false
 		}
+		if pendingStallNudge != "" {
+			oneShot = append(oneShot, Message{Role: "system", Content: pendingStallNudge})
+			pendingStallNudge = ""
+		}
+		if pendingRepairNudge != "" {
+			oneShot = append(oneShot, Message{Role: "system", Content: pendingRepairNudge})
+			pendingRepairNudge = ""
+		}
 		if len(oneShot) > 0 {
 			callMessages = append(append([]Message{}, messages...), oneShot...)
 		}
+		callMessages = ensureNonAssistantTail(callMessages)
 
+		callBudget := budget.current
+		if boostCompletion {
+			callBudget = max(callBudget, budget.finalAnswerBudget())
+		}
+		boostCompletion = false
 		llmReq := ChatCompletionRequest{
-			Model:     req.Model,
-			Messages:  callMessages,
-			Tools:     openAITools,
-			MaxTokens: budget.current,
+			Model:               req.Model,
+			Messages:            callMessages,
+			Tools:               openAITools,
+			MaxCompletionTokens: callBudget,
 		}
 		resp, effectiveModel, err := a.chatCompletionWithFallback(ctx, llmReq, req)
-		// The provider rejected max_tokens as too large for this model (e.g. after
-		// switching to a model with a smaller output limit). Shrink and retry; the
-		// lowered ceiling sticks for the rest of the run.
+		// The provider rejected the completion budget as too large for this model
+		// (e.g. after switching to a model with a smaller output limit). Shrink
+		// and retry; the lowered ceiling sticks for the rest of the run.
 		for err != nil && isMaxTokensRejection(err) && ctx.Err() == nil {
-			rejected := budget.current
-			if !budget.shrink() {
+			rejected := llmReq.MaxCompletionTokens
+			if !budget.shrinkBelow(rejected) {
 				break
 			}
 			a.logger.Warn("LLM rejected completion budget; retrying with a smaller one",
 				"rejected", rejected,
-				"retryWith", budget.current,
+				"retryWith", budget.ceiling,
 				"iteration", iteration)
-			llmReq.MaxTokens = budget.current
+			llmReq.MaxCompletionTokens = budget.ceiling
+			callBudget = budget.ceiling
 			resp, effectiveModel, err = a.chatCompletionWithFallback(ctx, llmReq, req)
 		}
 		if err != nil {
@@ -380,19 +451,82 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 			}
 		}
 
+		if len(msg.ToolCalls) == 0 && resp.Choices[0].FinishReason == "length" &&
+			!truncatedFinalRetried && iteration+1 < maxIter {
+			truncatedFinalRetried = true
+			boostCompletion = true
+			a.logger.Warn("Final answer truncated by completion budget; retrying with a larger budget",
+				"completionBudget", callBudget,
+				"retryBudget", budget.finalAnswerBudget(),
+				"contentChars", len(msg.Content),
+				"iteration", iteration)
+			continue
+		}
+
+		// Some models (reasoning-heavy ones in particular) occasionally end a
+		// turn with neither tool calls nor visible text. Ask once, explicitly,
+		// for the written answer instead of ending the run with nothing.
+		if len(msg.ToolCalls) == 0 && strings.TrimSpace(msg.Content) == "" &&
+			!emptyFinalRetried && iteration+1 < maxIter {
+			emptyFinalRetried = true
+			boostCompletion = true
+			a.logger.Warn("Model returned an empty final answer; requesting the written answer",
+				"finishReason", resp.Choices[0].FinishReason,
+				"iteration", iteration)
+			pendingRepairNudge = emptyFinalNudge
+			continue
+		}
+
 		if len(msg.ToolCalls) == 0 {
+			if strings.TrimSpace(msg.Content) == "" {
+				msg.Content = emptyFinalFallback
+			}
 			if msg.Content != "" {
+				// Structured final report: parse the fenced rca-report block
+				// (when the model emitted one), validate it against run
+				// reality, and strip it from what the user sees.
+				display := msg.Content
+				report := FinalReportEvent{
+					Verdict:    finalReportVerdict(req.ConversationType),
+					Confidence: "medium",
+					Summary:    summarizeFinalContent(msg.Content),
+				}
+				if parsed, cleaned, hasBlock := extractRCAReport(msg.Content); hasBlock {
+					if strings.TrimSpace(cleaned) == "" && lastFinalProse != "" {
+						cleaned = lastFinalProse
+					}
+					display = cleaned
+					report.Summary = summarizeFinalContent(cleaned)
+					report.Hypotheses = parsed.Hypotheses
+					report.Gaps = append(report.Gaps, parsed.Gaps...)
+					report.Confidence = derivedConfidence(parsed)
+					validation := validateRCAReport(parsed, evidenceOK, topologyEdges)
+
+					// One repair turn: an invalid report with budget left
+					// gets the warnings injected as a one-shot system
+					// message and the loop continues instead of ending.
+					if !validation.ok() && !repairUsed && iteration+1 < maxIter {
+						repairUsed = true
+						lastFinalProse = cleaned
+						messages = append(messages, msg)
+						pendingRepairNudge = repairNudgeText(validation.Warnings)
+						continue
+					}
+					validation.Repaired = repairUsed
+					if !validation.ok() {
+						// Surface the unresolved warnings as gaps so the user
+						// sees why confidence is not higher.
+						report.Gaps = append(report.Gaps, validation.Warnings...)
+					}
+					report.Validation = validation
+				}
 				a.send(ctx, eventCh, SSEEvent{
 					Type: "final_report",
-					Data: FinalReportEvent{
-						Verdict:    finalReportVerdict(req.ConversationType),
-						Confidence: "medium",
-						Summary:    summarizeFinalContent(msg.Content),
-					},
+					Data: report,
 				})
 				a.send(ctx, eventCh, SSEEvent{
 					Type: "content",
-					Data: ContentEvent{Content: msg.Content},
+					Data: ContentEvent{Content: display},
 				})
 			}
 			// Snapshot into a fresh map under the lock: background eviction-summary
@@ -421,6 +555,8 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 					TotalTokens:      totalTokens,
 					ToolCallCount:    toolCallCount,
 					UsageByModel:     usageSnapshot,
+					StallNudges:      stallNudges,
+					ForcedFinal:      forcedFinal,
 				},
 			})
 			return
@@ -429,11 +565,29 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 		msg.Content = ""
 		messages = append(messages, msg)
 
-		for _, tc := range msg.ToolCalls {
+		// Set up the batch: count every call and announce it before any
+		// execution starts, so the UI sees everything the model asked for.
+		// The repetition guard runs here too: an exact duplicate of an
+		// earlier successful call skips execution entirely (the finish phase
+		// replays the cached result with a directive), and near-duplicates
+		// feed the stall detector that nudges the model off repeated queries.
+		sigs := make([]string, len(msg.ToolCalls))
+		cachedHits := make([]stallCacheHit, len(msg.ToolCalls))
+		skipped := make([]bool, len(msg.ToolCalls))
+		for i, tc := range msg.ToolCalls {
 			if ctx.Err() != nil {
 				return
 			}
 			toolCallCount++
+			sigs[i] = canonicalToolSignature(tc.Function.Name, tc.Function.Arguments)
+			if hit, exact := stall.checkExact(sigs[i]); exact {
+				cachedHits[i] = hit
+				skipped[i] = true
+				stall.noteRepetition()
+			} else {
+				// observe counts near-duplicates itself; do not double-count.
+				stall.observe(tc.Function.Name, sigs[i])
+			}
 
 			a.send(ctx, eventCh, SSEEvent{
 				Type: "tool_call_start",
@@ -443,14 +597,62 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 					Arguments: tc.Function.Arguments,
 				},
 			})
+		}
 
-			var toolContent string
-			var isError bool
-			var errorKind string
-			if tc.Function.Name == loadSkillToolName && req.LoadSkill != nil {
-				toolContent, isError, errorKind = a.executeLoadSkill(ctx, tc, req)
-			} else {
-				toolContent, isError, errorKind = a.executeToolWithApproval(ctx, eventCh, tc, req)
+		// Execute the batch. Results land in results[i]; everything that
+		// touches shared run state (transport-failure map, history, pending
+		// summaries, ordered SSE events) happens below on the loop goroutine.
+		results := make([]toolExecResult, len(msg.ToolCalls))
+		if a.batchParallelizable(msg.ToolCalls, req) {
+			maxParallel := req.MaxParallelToolCalls
+			if maxParallel <= 0 {
+				maxParallel = defaultMaxParallelToolCalls
+			}
+			if maxParallel > len(msg.ToolCalls) {
+				maxParallel = len(msg.ToolCalls)
+			}
+			var wg sync.WaitGroup
+			sem := make(chan struct{}, maxParallel)
+			for i, tc := range msg.ToolCalls {
+				if skipped[i] {
+					continue
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					content, isError, errorKind := a.executeToolWithApproval(ctx, eventCh, tc, req)
+					results[i] = toolExecResult{content: content, isError: isError, errorKind: errorKind}
+				}()
+			}
+			wg.Wait()
+		} else {
+			for i, tc := range msg.ToolCalls {
+				if ctx.Err() != nil {
+					return
+				}
+				if skipped[i] {
+					continue
+				}
+				content, isError, errorKind := a.executeToolCall(ctx, eventCh, tc, req)
+				results[i] = toolExecResult{content: content, isError: isError, errorKind: errorKind}
+			}
+		}
+
+		// Finish the batch in the original call order: the assistant message
+		// lists ToolCalls in a fixed order and each tool result must line up
+		// with its call id, so results are appended in that order regardless
+		// of how (or how fast) they finished executing.
+		for i, tc := range msg.ToolCalls {
+			toolContent, isError, errorKind := results[i].content, results[i].isError, results[i].errorKind
+			if skipped[i] {
+				// Replay the cached earlier result with a directive so the
+				// model sees the repeat for what it is. No execution happened,
+				// so there is no error kind and nothing new to summarize.
+				isError = false
+				errorKind = ""
+				toolContent = duplicateCallContent(cachedHits[i])
 			}
 
 			a.send(ctx, eventCh, SSEEvent{
@@ -473,6 +675,16 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 				llmContent = fmt.Sprintf("MCP transport failure for %s. Result is unavailable; do not invent output. A compute or write may still have executed: check its existing status before any retry.", tc.Function.Name)
 				transportFailedTools[tc.Function.Name] = struct{}{}
 			}
+			// Cap each result at ingestion: an oversized result would otherwise ride
+			// along in every subsequent prompt until the whole window overflows.
+			llmContent = capToolResultAtIngestion(llmContent, limits.MaxToolResponseTokens)
+			if !isError {
+				// Expose the call id so final-report evidenceIds can cite it.
+				evID := evidenceIDFor(len(evidenceIDs) + 1)
+				evidenceIDs[evID] = true
+				llmContent = evidenceIDHeader(evID) + llmContent
+				successfulToolNames[tc.Function.Name] = true
+			}
 			messages = append(messages, Message{
 				Role:       "tool",
 				ToolCallID: tc.ID,
@@ -483,8 +695,9 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 			// Kick off this result's eviction summary now, in the background,
 			// instead of waiting until it's actually stale. Error results are
 			// never LLM-summarized (see evictStaleToolResults), so skip them;
-			// likewise when the admin disabled eviction summaries.
-			if !isError && !limits.ToolCallSummarizationDisabled {
+			// likewise replayed duplicates (the original result is already in
+			// history) and runs where the admin disabled eviction summaries.
+			if !isError && !skipped[i] && !limits.ToolCallSummarizationDisabled {
 				future := newToolResultSummaryFuture()
 				pendingSummaries[tc.ID] = future
 				toolName, toolResultContent := tc.Function.Name, toolContent
@@ -502,7 +715,9 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 					},
 				})
 			}
-			if !isError && tc.Function.Name != loadSkillToolName {
+			// Evidence events carry real tool outputs to the UI; replayed
+			// duplicates add nothing new and would inflate the evidence list.
+			if !isError && !skipped[i] && tc.Function.Name != loadSkillToolName {
 				a.send(ctx, eventCh, SSEEvent{
 					Type: "evidence",
 					Data: EvidenceEvent{
@@ -517,6 +732,37 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 			}
 		}
 
+		// Stall accounting: an iteration made progress iff at least one
+		// freshly executed call returned a non-error, non-empty result.
+		// Consecutive no-progress iterations trigger a nudge, then a forced
+		// final answer with a shortened remaining budget (see stall.go).
+		madeProgress := false
+		for i := range msg.ToolCalls {
+			if skipped[i] || results[i].isError || results[i].content == "" {
+				continue
+			}
+			madeProgress = true
+			stall.rememberSuccess(sigs[i], iteration, results[i].content)
+		}
+		stall.recordBatchProgress(madeProgress)
+		if kind, nudge, forced := stall.pendingNudge(); nudge != "" {
+			pendingStallNudge = nudge
+			stallNudges++
+			if forced {
+				forcedFinal = true
+				if iteration+2 < maxIter {
+					maxIter = iteration + 2
+				}
+			}
+			a.send(ctx, eventCh, SSEEvent{
+				Type: "stall",
+				Data: StallEvent{
+					Kind:      kind,
+					Iteration: iteration,
+					Message:   nudge,
+				},
+			})
+		}
 	}
 	a.send(ctx, eventCh, SSEEvent{
 		Type: "error",
@@ -579,7 +825,7 @@ func (a *AgentLoop) summarizeForEviction(ctx context.Context, req LoopRequest, u
 			{Role: "system", Content: evictionSummarySystemPrompt},
 			{Role: "user", Content: fmt.Sprintf("Tool: %s\n\nResult:\n%s", toolName, trimmed)},
 		},
-		MaxTokens: evictionSummaryMaxTokens,
+		MaxCompletionTokens: evictionSummaryMaxTokens,
 	}, req.GrafanaURL, req.AuthToken, req.OrgID)
 	if err != nil {
 		a.logger.Warn("Tool result eviction summary failed, falling back to truncation", "error", err, "tool", toolName)
@@ -683,9 +929,10 @@ func completionTokenBudget(maxTotalTokens int) int {
 	return budget
 }
 
-// completionBudget is the per-run max_tokens sent to the LLM. It starts at the
-// conservative completionTokenBudget, doubles (up to ceiling) when the model is
-// cut off mid tool call, and halves when the provider rejects it as too large.
+// completionBudget is the per-run max_completion_tokens sent to the LLM. It
+// starts at the conservative completionTokenBudget, doubles (up to ceiling) when
+// the model is cut off mid tool call, and halves when the provider rejects it as
+// too large.
 type completionBudget struct {
 	current int
 	ceiling int
@@ -717,16 +964,73 @@ func (b *completionBudget) grow() bool {
 	return true
 }
 
-// shrink halves the budget (not below minCompletionTokens) after the provider
-// rejected the current value, and lowers the ceiling so later growth never
-// returns to a rejected size. It reports false when the budget can't shrink.
-func (b *completionBudget) shrink() bool {
-	if b.current <= minCompletionTokens {
+// shrinkBelow lowers the ceiling to half of a rejected budget (not below
+// minCompletionTokens) and clamps the current budget to it, so later growth or
+// final-answer boosts never return to a rejected size. It reports false when
+// the rejected value is already at the minimum.
+func (b *completionBudget) shrinkBelow(rejected int) bool {
+	if rejected <= minCompletionTokens {
 		return false
 	}
-	b.current = max(b.current/2, minCompletionTokens)
-	b.ceiling = b.current
+	b.ceiling = max(rejected/2, minCompletionTokens)
+	b.current = min(b.current, b.ceiling)
 	return true
+}
+
+// finalAnswerBudget is the boosted budget for re-requesting a truncated or
+// empty final answer, bounded by the ceiling.
+func (b *completionBudget) finalAnswerBudget() int {
+	return min(finalAnswerCompletionTokens, b.ceiling)
+}
+
+// defaultMaxParallelToolCalls bounds concurrent tool execution when the model
+// emits several calls in one turn. LoopRequest.MaxParallelToolCalls (set from
+// plugin settings) overrides this; it is a floor for misconfigured zero values.
+const defaultMaxParallelToolCalls = 4
+
+// toolExecResult carries one tool call's outcome from the goroutine that
+// executed it back to the loop goroutine, which owns all shared run state and
+// event ordering.
+type toolExecResult struct {
+	content   string
+	isError   bool
+	errorKind string
+}
+
+// batchParallelizable reports whether a batch of tool calls can run
+// concurrently. Only plain MCP calls qualify: load_skill mutates loop-owned
+// skill state, and any call that might raise an approval prompt must stay
+// sequential so the user never faces two live approvals at once. If any call
+// is unqualified, the whole batch falls back to sequential execution.
+func (a *AgentLoop) batchParallelizable(calls []ToolCall, req LoopRequest) bool {
+	if len(calls) < 2 {
+		return false
+	}
+	for _, tc := range calls {
+		if tc.Function.Name == loadSkillToolName {
+			return false
+		}
+		tool, found := a.mcpProxy.FindToolByName(tc.Function.Name)
+		if !found {
+			return false
+		}
+		if approvalPolicyEnabled(req.ApprovalPolicy) {
+			if risk := mcp.ClassifyToolRisk(tool, req.MCPServers); risk.RequiresApproval {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// executeToolCall dispatches one tool call to its executor: the internal
+// load_skill tool goes to the skill registry, everything else through the
+// approval gate.
+func (a *AgentLoop) executeToolCall(ctx context.Context, eventCh chan<- SSEEvent, tc ToolCall, req LoopRequest) (content string, isError bool, errorKind string) {
+	if tc.Function.Name == loadSkillToolName && req.LoadSkill != nil {
+		return a.executeLoadSkill(ctx, tc, req)
+	}
+	return a.executeToolWithApproval(ctx, eventCh, tc, req)
 }
 
 func (a *AgentLoop) executeTool(ctx context.Context, tc ToolCall, req LoopRequest) (content string, isError bool, errorKind string) {
@@ -1045,4 +1349,35 @@ func (a *AgentLoop) send(ctx context.Context, ch chan<- SSEEvent, event SSEEvent
 	case ch <- event:
 	case <-ctx.Done():
 	}
+}
+
+// continueUserTurn is appended when a request would otherwise end on an
+// assistant turn with no steering message to follow it.
+const continueUserTurn = "Continue."
+
+// ensureNonAssistantTail guarantees the request does not end on an assistant
+// turn once system messages are set aside. Providers such as Gemini (through
+// LiteLLM) lift every system message into system_instruction and then reject
+// the request with 400 "Requests ending with a model turn are not supported".
+// That happens when a one-shot nudge (repair, stall, near-limit) follows an
+// assistant message: trailing system messages are re-sent as a user turn, or a
+// minimal user turn is appended when there is none. The input is not mutated.
+func ensureNonAssistantTail(msgs []Message) []Message {
+	last := len(msgs) - 1
+	for last >= 0 && msgs[last].Role == "system" {
+		last--
+	}
+	if last < 0 || msgs[last].Role != "assistant" {
+		return msgs
+	}
+	out := make([]Message, 0, len(msgs)+1)
+	out = append(out, msgs[:last+1]...)
+	if last == len(msgs)-1 {
+		return append(out, Message{Role: "user", Content: continueUserTurn})
+	}
+	for _, m := range msgs[last+1:] {
+		m.Role = "user"
+		out = append(out, m)
+	}
+	return out
 }

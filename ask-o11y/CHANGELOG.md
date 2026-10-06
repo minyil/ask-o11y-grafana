@@ -5,6 +5,61 @@ All notable changes to the Ask O11y Grafana plugin will be documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.22](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.21...v0.3.22) (2026-09-25)
+
+
+### Bug Fixes
+
+* **backend:** keep evidence ids on evicted tool results ([#234](https://github.com/Consensys/ask-o11y-plugin/issues/234)) ([843e9ba](https://github.com/Consensys/ask-o11y-plugin/commit/843e9bac53ef84da85d977ce3c80a2464a2bfac4))
+
+## [0.3.21](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.20...v0.3.21) (2026-09-25)
+
+
+### Bug Fixes
+
+* **backend:** ground rca evidence ids, keep repair prose, find service graph datasource ([#231](https://github.com/Consensys/ask-o11y-plugin/issues/231)) ([8ef914e](https://github.com/Consensys/ask-o11y-plugin/commit/8ef914e81ee8617357a997ef4b215ed4cdaa1d22))
+* **backend:** model-agnostic requests, fewer turns, local dev stack ([#233](https://github.com/Consensys/ask-o11y-plugin/issues/233)) ([039ebeb](https://github.com/Consensys/ask-o11y-plugin/commit/039ebebdd38107d3ca4a1854b93abc9f1ec719d3))
+
+## [0.3.20](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.19...v0.3.20) (2026-09-25)
+
+
+### Bug Fixes
+
+* **agent:** strip truncated rca-report blocks from final answers ([#229](https://github.com/Consensys/ask-o11y-plugin/issues/229)) ([621b387](https://github.com/Consensys/ask-o11y-plugin/commit/621b387d163f4f80928bab33a40377bc62fb1d10))
+
+## [0.3.19](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.18...v0.3.19) (2026-09-25)
+
+
+### Features
+
+* **backend:** rca reasoning guards for accuracy and speed ([#228](https://github.com/Consensys/ask-o11y-plugin/issues/228)) ([047725b](https://github.com/Consensys/ask-o11y-plugin/commit/047725bc4586d2697e69748e82806f9052d12d7b))
+
+## [0.3.18](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.17...v0.3.18) (2026-09-22)
+
+
+### Bug Fixes
+
+* **backend:** use max completion tokens ([#226](https://github.com/Consensys/ask-o11y-plugin/issues/226)) ([b1be8de](https://github.com/Consensys/ask-o11y-plugin/commit/b1be8de012eb70fab159885ecac8e4af468feed8))
+
+## [0.3.17](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.16...v0.3.17) (2026-09-18)
+
+
+### Features
+
+* **chat:** rework bundled skills using grafana/skills as reference ([#224](https://github.com/Consensys/ask-o11y-plugin/issues/224)) ([670eedd](https://github.com/Consensys/ask-o11y-plugin/commit/670eedddf0565311bb307226dcfcff790cf7e821))
+
+## [Unreleased]
+
+### Added
+
+* **skills:** new bundled skills `optimizing-metrics-cost` (cardinality/cost triage, label strategy, Adaptive Metrics guidance) and `writing-k6-tests` (k6 load-test scripts and Synthetic Monitoring check authoring)
+* reference material for bundled skills: TraceQL, profile types, alerting anatomy, dashboard JSON
+* `pkg/skills/bundled/NOTICE.md` crediting grafana/skills (Apache-2.0) for adapted content
+
+### Changed
+
+* **skills:** reworked all 8 bundled skills using [grafana/skills](https://github.com/grafana/skills) as reference — expanded PromQL/LogQL reference libraries, TraceQL and profile-interpretation guidance, alert-rule anatomy and "not firing" checklist, dashboard JSON/panel-selection guidance; descriptions rewritten as trigger phrases
+
 ## [0.3.16](https://github.com/Consensys/ask-o11y-plugin/compare/v0.3.15...v0.3.16) (2026-09-11)
 
 

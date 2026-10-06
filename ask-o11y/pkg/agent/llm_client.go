@@ -40,16 +40,16 @@ const (
 var errIncompleteStream = errors.New("LLM stream ended before completion (no finish_reason)")
 
 type LLMHTTPError struct {
-	StatusCode   int
-	Status       string
-	RequestID    string
-	TraceID      string
-	Model        string
-	MessageCount int
-	ToolCount    int
-	MaxTokens    int
-	RequestBytes int
-	Retryable    bool
+	StatusCode          int
+	Status              string
+	RequestID           string
+	TraceID             string
+	Model               string
+	MessageCount        int
+	ToolCount           int
+	MaxCompletionTokens int
+	RequestBytes        int
+	Retryable           bool
 	// Detail is the leading part of the provider's error body. It is logged and
 	// used to classify the failure, but never shown to end users.
 	Detail string
@@ -158,7 +158,7 @@ func (c *LLMClient) ChatCompletion(ctx context.Context, req ChatCompletionReques
 		attribute.String("llm.model", req.Model),
 		attribute.Int("llm.message_count", len(req.Messages)),
 		attribute.Int("llm.tool_count", len(req.Tools)),
-		attribute.Int("llm.max_tokens", req.MaxTokens),
+		attribute.Int("llm.max_completion_tokens", req.MaxCompletionTokens),
 		attribute.Int("llm.request_bytes", len(body)),
 	)
 
@@ -172,7 +172,7 @@ func (c *LLMClient) ChatCompletion(ctx context.Context, req ChatCompletionReques
 			"url", httpReq.URL.String(),
 			"messageCount", len(req.Messages),
 			"toolCount", len(req.Tools),
-			"maxTokens", req.MaxTokens,
+			"maxCompletionTokens", req.MaxCompletionTokens,
 			"requestBytes", len(body),
 			"model", req.Model,
 			"attempt", attempt,
@@ -209,7 +209,7 @@ func (c *LLMClient) ChatCompletion(ctx context.Context, req ChatCompletionReques
 				"model", llmErr.Model,
 				"messageCount", llmErr.MessageCount,
 				"toolCount", llmErr.ToolCount,
-				"maxTokens", llmErr.MaxTokens,
+				"maxCompletionTokens", llmErr.MaxCompletionTokens,
 				"requestBytes", llmErr.RequestBytes,
 				"detail", llmErr.Detail,
 				"attempt", attempt)
@@ -253,23 +253,24 @@ func (c *LLMClient) buildHTTPError(resp *http.Response, req ChatCompletionReques
 	requestID, traceID := llmDiagnosticHeaders(resp.Header)
 	detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorDetailBytes))
 	return &LLMHTTPError{
-		StatusCode:   resp.StatusCode,
-		Status:       resp.Status,
-		RequestID:    requestID,
-		TraceID:      traceID,
-		Model:        req.Model,
-		MessageCount: len(req.Messages),
-		ToolCount:    len(req.Tools),
-		MaxTokens:    req.MaxTokens,
-		RequestBytes: requestBytes,
-		Retryable:    isRetryableLLMStatus(resp.StatusCode),
-		Detail:       strings.TrimSpace(string(detail)),
+		StatusCode:          resp.StatusCode,
+		Status:              resp.Status,
+		RequestID:           requestID,
+		TraceID:             traceID,
+		Model:               req.Model,
+		MessageCount:        len(req.Messages),
+		ToolCount:           len(req.Tools),
+		MaxCompletionTokens: req.MaxCompletionTokens,
+		RequestBytes:        requestBytes,
+		Retryable:           isRetryableLLMStatus(resp.StatusCode),
+		Detail:              strings.TrimSpace(string(detail)),
 	}
 }
 
 // isMaxTokensRejection reports whether err is a 400 caused by the requested
-// max_tokens exceeding what the model allows (its output limit, or what is left
-// of its context window). Shrinking max_tokens and retrying can fix these.
+// completion budget (max_completion_tokens / max_tokens) exceeding what the
+// model allows (its output limit, or what is left
+// of its context window). Shrinking the budget and retrying can fix these.
 func isMaxTokensRejection(err error) bool {
 	var llmErr *LLMHTTPError
 	if !errors.As(err, &llmErr) || llmErr.StatusCode != http.StatusBadRequest {
