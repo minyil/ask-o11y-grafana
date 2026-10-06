@@ -125,11 +125,11 @@ type LoopRequest struct {
 	// tool-call contexts so OAuth-enabled servers use that user's token and
 	// analysis servers receive the actor behind the service identity.
 	// SessionID above is also forwarded so those servers scope artifacts to it.
-	UserID          int64
-	UploadDatasetID string
-	OrgID           string
-	OrgName         string
-	ScopeOrgID      string
+	UserID           int64
+	UploadDatasetIDs []string
+	OrgID            string
+	OrgName          string
+	ScopeOrgID       string
 
 	// ExcludeToolNames, when set, removes these tools from the available set
 	// before the loop runs. Used to hide graphiti write tools from user sessions.
@@ -190,8 +190,8 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 	}
 
 	systemPrompt := req.SystemPrompt
-	if req.UploadDatasetID != "" {
-		systemPrompt += "\n\nCurrent session attachment dataset_id: " + req.UploadDatasetID
+	if prompt := uploadedDatasetsPrompt(req.UploadDatasetIDs); prompt != "" {
+		systemPrompt += prompt
 	}
 	messages := BuildContextWindow(systemPrompt, req.Messages, req.Summary, req.RecentMessageCount)
 
@@ -1380,4 +1380,18 @@ func ensureNonAssistantTail(msgs []Message) []Message {
 		out = append(out, m)
 	}
 	return out
+}
+
+// uploadedDatasetsPrompt tells the model which uploads belong to the session.
+// With more than one, it points at the multi-document preprocessing path so
+// combining files happens in one sandbox run instead of per-file guesswork.
+func uploadedDatasetsPrompt(ids []string) string {
+	switch len(ids) {
+	case 0:
+		return ""
+	case 1:
+		return "\n\nCurrent session attachment dataset_id: " + ids[0]
+	}
+	return "\n\nCurrent session attachment dataset_ids: " + strings.Join(ids, ", ") +
+		"\nThese are separate uploaded files. When the request needs them combined (merge, join, append, compare), inspect each one, then call execute_python_preprocessing once with the first document_ref as document_ref and the rest as additional_document_refs; combine them with pandas using the documents list and emit_frame the combined table so later steps reuse its derived_dataset_id."
 }

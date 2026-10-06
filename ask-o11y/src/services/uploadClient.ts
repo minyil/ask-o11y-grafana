@@ -3,6 +3,8 @@ import { pluginUrl } from '../utils/subpath';
 
 const UPLOAD_URL = pluginUrl('/api/uploads');
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+// Mirrors maxUploadsPerSession in pkg/plugin/sessionstore.go.
+export const MAX_UPLOADS_PER_SESSION = 5;
 
 function orgHeaders(): Record<string, string> {
   return { 'X-Grafana-Org-Id': String(config.bootData.user.orgId || '1') };
@@ -70,4 +72,16 @@ export async function removeUploadedDataset(datasetId: string, sessionId: string
   if (!response.ok) {
     throw new Error(`Remove failed (${response.status})`);
   }
+}
+
+function describeDataset(dataset: UploadedDataset): string {
+  const sheetLabel = dataset.sheet ? `, sheet: ${dataset.sheet}` : '';
+  return `\`${dataset.dataset_id}\` (${dataset.filename}${sheetLabel}, ${dataset.rows} rows, ${dataset.columns} columns)`;
+}
+
+export function uploadedDatasetsMessage(datasets: UploadedDataset[]): string {
+  if (datasets.length === 1) {
+    return `Use uploaded dataset ${describeDataset(datasets[0])}. `;
+  }
+  return `Use uploaded datasets ${datasets.map(describeDataset).join(', ')}. `;
 }

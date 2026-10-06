@@ -2601,3 +2601,16 @@ func TestAgentLoop_EmptyFinalAnswerNudgedOnceThenFallback(t *testing.T) {
 		})
 	}
 }
+
+func TestUploadedDatasetsPrompt(t *testing.T) {
+	if got := uploadedDatasetsPrompt(nil); got != "" {
+		t.Fatalf("no uploads should add nothing, got %q", got)
+	}
+	if got := uploadedDatasetsPrompt([]string{"upload_a"}); got != "\n\nCurrent session attachment dataset_id: upload_a" {
+		t.Fatalf("single upload prompt changed: %q", got)
+	}
+	got := uploadedDatasetsPrompt([]string{"upload_a", "upload_b"})
+	if !strings.Contains(got, "dataset_ids: upload_a, upload_b") || !strings.Contains(got, "additional_document_refs") {
+		t.Fatalf("multi upload prompt missing ids or merge path: %q", got)
+	}
+}

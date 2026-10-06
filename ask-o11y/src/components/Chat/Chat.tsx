@@ -22,7 +22,13 @@ import { ChatErrorBoundary } from '../ErrorBoundary';
 import type { SessionMetadata } from './hooks/useSessionManager';
 import type { ChatMessage } from './types';
 import type { AppPluginSettings } from '../../types/plugin';
-import { removeUploadedDataset, type UploadedDataset } from '../../services/uploadClient';
+import {
+  MAX_UPLOADS_PER_SESSION,
+  removeUploadedDataset,
+  uploadedDatasetsMessage,
+  type UploadedDataset,
+} from '../../services/uploadClient';
+import { testIds } from '../testIds';
 import {
   formatModelLabel,
   formatModelSelectionLabel,
@@ -58,7 +64,7 @@ function ChatComponent({
   const [modelOptions, setModelOptions] = useState<LLMModelOption[]>([]);
   const [selectedModel, setSelectedModel] = useState<LLMModelSelection>('auto');
   const [skillCommands, setSkillCommands] = useState<SkillCommand[]>([]);
-  const [uploaded, setUploaded] = useState<{ dataset: UploadedDataset; sessionId: string } | null>(null);
+  const [uploaded, setUploaded] = useState<{ datasets: UploadedDataset[]; sessionId: string } | null>(null);
 
   const kioskModeEnabled = pluginSettings?.kioskModeEnabled ?? true;
   const chatPanelPosition = pluginSettings?.chatPanelPosition || 'right';
@@ -158,16 +164,39 @@ function ChatComponent({
     [setCurrentInput]
   );
 
-  const handleUploaded = useCallback(
-    (message: string, sessionId: string, dataset: UploadedDataset) => {
-      setUploaded({ dataset, sessionId });
-      void sessionManager.loadSession(sessionId).then(() => {
-        setCurrentInput(message);
-        setTimeout(() => chatInputRef.current?.focus(), 100);
-      });
-    },
-    [sessionManager, setCurrentInput]
+  const currentUploads = useMemo(
+    () => (uploaded && uploaded.sessionId === sessionManager.currentSessionId ? uploaded.datasets : []),
+    [uploaded, sessionManager.currentSessionId]
   );
+
+  const handleUploaded = useCallback(
+    (sessionId: string, datasets: UploadedDataset[]) => {
+      const joined = uploaded?.sessionId === sessionId ? [...uploaded.datasets, ...datasets] : datasets;
+      setUploaded({ datasets: joined, sessionId });
+      const showMessage = () => {
+        setCurrentInput(uploadedDatasetsMessage(joined));
+        setTimeout(() => chatInputRef.current?.focus(), 100);
+      };
+      if (sessionId === sessionManager.currentSessionId) {
+        showMessage();
+      } else {
+        void sessionManager.loadSession(sessionId).then(showMessage);
+      }
+    },
+    [sessionManager, setCurrentInput, uploaded]
+  );
+
+  const handleRemoveUpload = useCallback((dataset: UploadedDataset, sessionId: string) => {
+    void removeUploadedDataset(dataset.dataset_id, sessionId)
+      .then(() =>
+        setUploaded((previous) =>
+          previous && previous.sessionId === sessionId
+            ? { sessionId, datasets: previous.datasets.filter((item) => item.dataset_id !== dataset.dataset_id) }
+            : previous
+        )
+      )
+      .catch((error) => window.alert(error instanceof Error ? error.message : 'Remove failed'));
+  }, []);
 
   const currentSession = sessionManager.sessions.find((s: SessionMetadata) => s.id === sessionManager.currentSessionId);
   const currentSessionTitle = currentSession?.title;
@@ -212,28 +241,34 @@ function ChatComponent({
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2">
             <NewChatButton onConfirm={clearChat} isGenerating={isGenerating} />
-            <UploadButton disabled={isGenerating} onUploaded={handleUploaded} />
+            <UploadButton
+              disabled={isGenerating}
+              targetSessionId={currentUploads.length > 0 ? uploaded?.sessionId : undefined}
+              remaining={MAX_UPLOADS_PER_SESSION - currentUploads.length}
+              onUploaded={handleUploaded}
+            />
             {modelSelector}
           </div>
-          {uploaded && uploaded.sessionId === sessionManager.currentSessionId && (
-            <div className="flex items-center gap-2 text-xs text-secondary">
-              <span className="truncate" title={uploaded.dataset.filename}>
-                {uploaded.dataset.filename} · {uploaded.dataset.rows} rows · {uploaded.dataset.columns} columns
-                {uploaded.dataset.sheet ? ` · ${uploaded.dataset.sheet}` : ''}
-              </span>
-              <button
-                type="button"
-                className="text-error"
-                onClick={() => {
-                  void removeUploadedDataset(uploaded.dataset.dataset_id, uploaded.sessionId)
-                    .then(() => setUploaded(null))
-                    .catch((error) => window.alert(error instanceof Error ? error.message : 'Remove failed'));
-                }}
+          {uploaded &&
+            currentUploads.map((dataset) => (
+              <div
+                key={dataset.dataset_id}
+                className="flex items-center gap-2 text-xs text-secondary"
+                data-testid={testIds.chat.uploadedDataset(dataset.dataset_id)}
               >
-                Remove
-              </button>
-            </div>
-          )}
+                <span className="truncate" title={dataset.filename}>
+                  {dataset.filename} · {dataset.rows} rows · {dataset.columns} columns
+                  {dataset.sheet ? ` · ${dataset.sheet}` : ''}
+                </span>
+                <button
+                  type="button"
+                  className="text-error"
+                  onClick={() => handleRemoveUpload(dataset, uploaded.sessionId)}
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
         </div>
       ),
       rightSlot: (
@@ -258,8 +293,9 @@ function ChatComponent({
       currentSessionTitle,
       currentModelLabel,
       sessionManager.sessions.length,
-      sessionManager.currentSessionId,
       uploaded,
+      currentUploads,
+      handleRemoveUpload,
       setCurrentInput,
       sendMessage,
       handleKeyPress,

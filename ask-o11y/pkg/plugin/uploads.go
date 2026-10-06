@@ -2,10 +2,12 @@ package plugin
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -66,8 +68,13 @@ func (p *Plugin) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID, orgID := getUserID(r), getOrgID(r)
-	if _, err := p.sessionStore.GetSession(sessionID, userID, orgID); err != nil {
+	session, err := p.sessionStore.GetSession(sessionID, userID, orgID)
+	if err != nil {
 		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+	if len(session.UploadDatasetIDs) >= maxUploadsPerSession {
+		writeUploadLimitError(w)
 		return
 	}
 	baseURL, headers, ok := p.grafanaQueryServer()
@@ -118,7 +125,13 @@ func (p *Plugin) handleUpload(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Upload service returned an invalid dataset", http.StatusBadGateway)
 			return
 		}
-		if err := p.sessionStore.SetUploadDatasetID(sessionID, userID, orgID, uploaded.DatasetID); err != nil {
+		if err := p.sessionStore.AddUploadDatasetID(sessionID, userID, orgID, uploaded.DatasetID); err != nil {
+			// A concurrent upload can fill the session after the pre-check; the
+			// stored file is then unattached and expires with the upload TTL.
+			if errors.Is(err, ErrUploadLimit) {
+				writeUploadLimitError(w)
+				return
+			}
 			p.logger.Error("Failed to attach uploaded dataset to session", "error", err)
 			http.Error(w, "Could not attach uploaded dataset to session", http.StatusInternalServerError)
 			return
@@ -131,6 +144,12 @@ func (p *Plugin) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = w.Write(body)
+}
+
+func writeUploadLimitError(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": ErrUploadLimit.Error()})
 }
 
 func isValidUploadDatasetID(value string) bool {
@@ -190,8 +209,8 @@ func (p *Plugin) handleDeleteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-		if session, err := p.sessionStore.GetSession(sessionID, userID, orgID); err == nil && session.UploadDatasetID == datasetID {
-			if err := p.sessionStore.SetUploadDatasetID(sessionID, userID, orgID, ""); err != nil {
+		if session, err := p.sessionStore.GetSession(sessionID, userID, orgID); err == nil && slices.Contains(session.UploadDatasetIDs, datasetID) {
+			if err := p.sessionStore.RemoveUploadDatasetID(sessionID, userID, orgID, datasetID); err != nil {
 				p.logger.Error("Failed to clear uploaded dataset session attachment", "error", err)
 				http.Error(w, "Could not clear uploaded dataset session attachment", http.StatusInternalServerError)
 				return

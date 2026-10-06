@@ -3,6 +3,7 @@ package plugin
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -19,18 +20,18 @@ type SessionMessage struct {
 }
 
 type ChatSession struct {
-	ID              string           `json:"id"`
-	Title           string           `json:"title"`
-	Messages        []SessionMessage `json:"messages"`
-	Summary         string           `json:"summary,omitempty"`
-	CreatedAt       time.Time        `json:"createdAt"`
-	UpdatedAt       time.Time        `json:"updatedAt"`
-	MessageCount    int              `json:"messageCount"`
-	ActiveRunID     string           `json:"activeRunId,omitempty"`
-	Model           string           `json:"model,omitempty"`
-	UploadDatasetID string           `json:"uploadDatasetId,omitempty"`
-	UserID          int64            `json:"-"`
-	OrgID           int64            `json:"-"`
+	ID               string           `json:"id"`
+	Title            string           `json:"title"`
+	Messages         []SessionMessage `json:"messages"`
+	Summary          string           `json:"summary,omitempty"`
+	CreatedAt        time.Time        `json:"createdAt"`
+	UpdatedAt        time.Time        `json:"updatedAt"`
+	MessageCount     int              `json:"messageCount"`
+	ActiveRunID      string           `json:"activeRunId,omitempty"`
+	Model            string           `json:"model,omitempty"`
+	UploadDatasetIDs []string         `json:"uploadDatasetIds,omitempty"`
+	UserID           int64            `json:"-"`
+	OrgID            int64            `json:"-"`
 
 	// Usage stats, accumulated from each completed agent run's DoneEvent.
 	// Runs are TTL'd out of Redis after RunMaxAge, so these must be
@@ -86,7 +87,10 @@ type SessionStoreInterface interface {
 	SetActiveRunID(sessionID string, userID, orgID int64, runID string) error
 	ClearActiveRunID(sessionID string, userID, orgID int64) error
 	IncrementStats(sessionID string, userID, orgID int64, delta SessionStatsDelta) error
-	SetUploadDatasetID(sessionID string, userID, orgID int64, datasetID string) error
+	// AddUploadDatasetID attaches an uploaded dataset to the session, refusing
+	// with ErrUploadLimit once maxUploadsPerSession are attached.
+	AddUploadDatasetID(sessionID string, userID, orgID int64, datasetID string) error
+	RemoveUploadDatasetID(sessionID string, userID, orgID int64, datasetID string) error
 	// CleanupOld removes sessions past the store's configured retention
 	// window. Redis-backed stores expire sessions natively (see
 	// NewRedisSessionStore) and implement this as a no-op.
@@ -184,7 +188,7 @@ func (s *SessionStore) GetSession(sessionID string, userID, orgID int64) (*ChatS
 	return &copied, nil
 }
 
-func (s *SessionStore) SetUploadDatasetID(sessionID string, userID, orgID int64, datasetID string) error {
+func (s *SessionStore) AddUploadDatasetID(sessionID string, userID, orgID int64, datasetID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -192,9 +196,46 @@ func (s *SessionStore) SetUploadDatasetID(sessionID string, userID, orgID int64,
 	if !exists || session.UserID != userID || session.OrgID != orgID {
 		return fmt.Errorf("session not found")
 	}
-	session.UploadDatasetID = datasetID
+	ids, err := withUploadDatasetID(session.UploadDatasetIDs, datasetID)
+	if err != nil {
+		return err
+	}
+	session.UploadDatasetIDs = ids
 	session.UpdatedAt = time.Now()
 	return nil
+}
+
+func (s *SessionStore) RemoveUploadDatasetID(sessionID string, userID, orgID int64, datasetID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, exists := s.sessions[sessionID]
+	if !exists || session.UserID != userID || session.OrgID != orgID {
+		return fmt.Errorf("session not found")
+	}
+	session.UploadDatasetIDs = withoutUploadDatasetID(session.UploadDatasetIDs, datasetID)
+	session.UpdatedAt = time.Now()
+	return nil
+}
+
+// maxUploadsPerSession bounds how many uploaded datasets one conversation can
+// combine; each one is copied into every preprocessing sandbox that uses it.
+const maxUploadsPerSession = 5
+
+var ErrUploadLimit = fmt.Errorf("a session can hold at most %d uploaded files", maxUploadsPerSession)
+
+func withUploadDatasetID(ids []string, datasetID string) ([]string, error) {
+	if slices.Contains(ids, datasetID) {
+		return ids, nil
+	}
+	if len(ids) >= maxUploadsPerSession {
+		return ids, ErrUploadLimit
+	}
+	return append(slices.Clone(ids), datasetID), nil
+}
+
+func withoutUploadDatasetID(ids []string, datasetID string) []string {
+	return slices.DeleteFunc(slices.Clone(ids), func(id string) bool { return id == datasetID })
 }
 
 func (s *SessionStore) ListSessions(userID, orgID int64) ([]SessionMetadata, error) {

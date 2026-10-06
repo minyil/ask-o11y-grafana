@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -28,18 +29,21 @@ func sessionStatsKey(id string) string { return fmt.Sprintf("session:%s:stats", 
 // Usage-stats fields live in a separate hash (sessionStatsKey) so they never
 // round-trip through session blob updates — see IncrementStats.
 type redisSession struct {
-	ID              string           `json:"id"`
-	Title           string           `json:"title"`
-	Messages        []SessionMessage `json:"messages"`
-	Summary         string           `json:"summary,omitempty"`
-	CreatedAt       time.Time        `json:"createdAt"`
-	UpdatedAt       time.Time        `json:"updatedAt"`
-	MessageCount    int              `json:"messageCount"`
-	ActiveRunID     string           `json:"activeRunId,omitempty"`
-	Model           string           `json:"model,omitempty"`
-	UploadDatasetID string           `json:"uploadDatasetId,omitempty"`
-	UserID          int64            `json:"userId"`
-	OrgID           int64            `json:"orgId"`
+	ID               string           `json:"id"`
+	Title            string           `json:"title"`
+	Messages         []SessionMessage `json:"messages"`
+	Summary          string           `json:"summary,omitempty"`
+	CreatedAt        time.Time        `json:"createdAt"`
+	UpdatedAt        time.Time        `json:"updatedAt"`
+	MessageCount     int              `json:"messageCount"`
+	ActiveRunID      string           `json:"activeRunId,omitempty"`
+	Model            string           `json:"model,omitempty"`
+	UploadDatasetIDs []string         `json:"uploadDatasetIds,omitempty"`
+	// UploadDatasetID is the single-upload field written before multi-file
+	// uploads; it is read once and folded into UploadDatasetIDs.
+	UploadDatasetID string `json:"uploadDatasetId,omitempty"`
+	UserID          int64  `json:"userId"`
+	OrgID           int64  `json:"orgId"`
 }
 
 func toRedis(s *ChatSession) *redisSession {
@@ -47,7 +51,7 @@ func toRedis(s *ChatSession) *redisSession {
 		ID: s.ID, Title: s.Title, Messages: s.Messages,
 		Summary: s.Summary, CreatedAt: s.CreatedAt, UpdatedAt: s.UpdatedAt,
 		MessageCount: s.MessageCount, ActiveRunID: s.ActiveRunID, Model: s.Model,
-		UploadDatasetID: s.UploadDatasetID, UserID: s.UserID, OrgID: s.OrgID,
+		UploadDatasetIDs: s.UploadDatasetIDs, UserID: s.UserID, OrgID: s.OrgID,
 	}
 }
 
@@ -56,8 +60,15 @@ func fromRedis(rs *redisSession) *ChatSession {
 		ID: rs.ID, Title: rs.Title, Messages: rs.Messages,
 		Summary: rs.Summary, CreatedAt: rs.CreatedAt, UpdatedAt: rs.UpdatedAt,
 		MessageCount: rs.MessageCount, ActiveRunID: rs.ActiveRunID, Model: rs.Model,
-		UploadDatasetID: rs.UploadDatasetID, UserID: rs.UserID, OrgID: rs.OrgID,
+		UploadDatasetIDs: rs.uploadDatasetIDs(), UserID: rs.UserID, OrgID: rs.OrgID,
 	}
+}
+
+func (rs *redisSession) uploadDatasetIDs() []string {
+	if rs.UploadDatasetID == "" || slices.Contains(rs.UploadDatasetIDs, rs.UploadDatasetID) {
+		return rs.UploadDatasetIDs
+	}
+	return append([]string{rs.UploadDatasetID}, rs.UploadDatasetIDs...)
 }
 
 type RedisSessionStore struct {
@@ -274,9 +285,27 @@ func parseStatsField(v string) int {
 	return n
 }
 
-func (s *RedisSessionStore) SetUploadDatasetID(sessionID string, userID, orgID int64, datasetID string) error {
+func (s *RedisSessionStore) AddUploadDatasetID(sessionID string, userID, orgID int64, datasetID string) error {
+	var limitErr error
+	err := s.mutateSession(sessionID, userID, orgID, func(session *ChatSession) {
+		// mutateSession reruns this on a WATCH conflict; keep only the last verdict.
+		ids, err := withUploadDatasetID(session.UploadDatasetIDs, datasetID)
+		limitErr = err
+		if err != nil {
+			return
+		}
+		session.UploadDatasetIDs = ids
+		session.UpdatedAt = time.Now()
+	})
+	if err != nil {
+		return err
+	}
+	return limitErr
+}
+
+func (s *RedisSessionStore) RemoveUploadDatasetID(sessionID string, userID, orgID int64, datasetID string) error {
 	return s.mutateSession(sessionID, userID, orgID, func(session *ChatSession) {
-		session.UploadDatasetID = datasetID
+		session.UploadDatasetIDs = withoutUploadDatasetID(session.UploadDatasetIDs, datasetID)
 		session.UpdatedAt = time.Now()
 	})
 }

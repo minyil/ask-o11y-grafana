@@ -74,6 +74,10 @@ MAX_OUTPUT_FIELDS = 200
 MAX_OUTPUT_ITEMS = 64
 MAX_DERIVED_ROWS = 5_000
 MAX_DERIVED_BYTES = 4 * 1024 * 1024
+# One primary plus at most four additional uploads (the plugin's per-session
+# limit), bounded in total so a multi-file merge cannot exhaust sandbox memory.
+MAX_ADDITIONAL_DOCUMENTS = 4
+MAX_COMBINED_DOCUMENT_BYTES = 100 * 1024 * 1024
 DERIVED_FRAME_MIME = "application/vnd.ask-o11y.dataframe+json"
 DEFAULT_SEED = 42
 DEFAULT_PRESENTATION_MODE = "plotly"
@@ -157,11 +161,12 @@ TOOLS = [
     },
     {
         "name": "execute_python_preprocessing",
-        "description": "Execute generated Python over one authorized original uploaded CSV/XLSX document in a fresh network-denied OpenSandbox when the user's request permits reading the original document. The sandbox receives document_path, input_format, pd, np, emit, and emit_frame. emit_frame returns both a derived_frame_ref and a session-owned derived_dataset_id for later Sandbox or Grafana Query steps.",
+        "description": "Execute generated Python over one or more authorized original uploaded CSV/XLSX documents of the same session in a fresh network-denied OpenSandbox when the user's request permits reading the original documents. The sandbox receives document_path, input_format, pd, np, emit, and emit_frame. When additional_document_refs are given it also receives documents: a list of {path, input_format, filename, sheet} for every document, primary first, so the code can read, merge, join, or append them with pandas. emit_frame returns both a derived_frame_ref and a session-owned derived_dataset_id for later Sandbox or Grafana Query steps.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "document_ref": {"type": "string", "description": "Opaque authorized uploaded-document artifact ref returned by Grafana Query inspect_dataset."},
+                "additional_document_refs": {"type": "array", "maxItems": MAX_ADDITIONAL_DOCUMENTS, "uniqueItems": True, "items": {"type": "string"}, "description": "Optional document_refs of other uploads in the same session, each returned by its own inspect_dataset call. Use only when the request needs several uploaded files combined or compared."},
                 "python_code": {"type": "string", "maxLength": MAX_CODE_BYTES, "description": "Python source executed only inside the isolated sandbox."},
                 "seed": {"type": "integer", "minimum": 0, "maximum": 4294967295, "default": DEFAULT_SEED}
             },
@@ -332,8 +337,28 @@ def wrapped_code(python_code: str, seed: int) -> str:
     return f"from capture import run\nrun({python_code!r}, '/tmp/input-frame.json', {seed})"
 
 
-def wrapped_document_code(python_code: str, input_format: str, seed: int) -> str:
-    return f"from capture import run_document\nrun_document({python_code!r}, '/tmp/input-document.{input_format}', {input_format!r}, {seed})"
+def document_input_path(index: int, input_format: str) -> str:
+    return f"/tmp/input-document.{input_format}" if index == 0 else f"/tmp/input-document-{index}.{input_format}"
+
+
+def wrapped_document_code(python_code: str, input_format: str, seed: int, documents: list[dict[str, Any]] | None = None) -> str:
+    run = f"run_document({python_code!r}, {document_input_path(0, input_format)!r}, {input_format!r}, {seed})"
+    if not documents or len(documents) < 2:
+        return f"from capture import run_document\n{run}"
+    # The deployed sandbox image's capture.run_document takes one document, so
+    # the extra ones are exposed by wrapping capture.execute, which
+    # run_document resolves through the module globals at call time.
+    listing = [{key: item.get(key) for key in ("path", "input_format", "filename", "sheet")} for item in documents]
+    return (
+        "import capture\n"
+        f"_documents = {listing!r}\n"
+        "_execute = capture.execute\n"
+        "def _execute_with_documents(code, seed, namespace, *rest):\n"
+        "    namespace['documents'] = [dict(item) for item in _documents]\n"
+        "    return _execute(code, seed, namespace, *rest)\n"
+        "capture.execute = _execute_with_documents\n"
+        f"from capture import run_document\n{run}"
+    )
 
 
 def serialize_execution(execution: Any) -> dict[str, Any]:
@@ -446,7 +471,7 @@ def read_input_audit(filesystem: Any) -> dict[str, Any]:
     return audit
 
 
-def execute_opensandbox_input(input_path: str, input_data: str | bytes, source: str, *, capture_required: bool = True) -> dict[str, Any]:
+def execute_opensandbox_input(input_path: str, input_data: str | bytes, source: str, *, capture_required: bool = True, extra_inputs: tuple[tuple[str, bytes], ...] = ()) -> dict[str, Any]:
     from code_interpreter.models.code import SupportedLanguage
     from code_interpreter.sync.code_interpreter import CodeInterpreterSync
     from opensandbox.config import ConnectionConfigSync
@@ -504,7 +529,7 @@ def execute_opensandbox_input(input_path: str, input_data: str | bytes, source: 
             time.sleep(0.2)
         if pending is not None:
             pending.check()
-        sandbox.files.write_files([WriteEntry(path=input_path, data=input_data, mode=600)])
+        sandbox.files.write_files([WriteEntry(path=path, data=data, mode=600) for path, data in ((input_path, input_data), *extra_inputs)])
         code_service = CodeInterpreterSync.create(sandbox=sandbox).codes
         execution = code_service.run(
             source,
@@ -544,8 +569,17 @@ def execute_opensandbox(frame_bundle_json: str, python_code: str, seed: int) -> 
     return execute_opensandbox_input("/tmp/input-frame.json", frame_bundle_json, wrapped_code(python_code, seed))
 
 
-def execute_document_opensandbox(document_bytes: bytes, input_format: str, python_code: str, seed: int) -> dict[str, Any]:
-    return execute_opensandbox_input(f"/tmp/input-document.{input_format}", document_bytes, wrapped_document_code(python_code, input_format, seed))
+def execute_document_opensandbox(document_bytes: bytes, input_format: str, python_code: str, seed: int, additional: tuple[tuple[bytes, dict[str, Any]], ...] = (), primary: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not additional:
+        return execute_opensandbox_input(document_input_path(0, input_format), document_bytes, wrapped_document_code(python_code, input_format, seed))
+    primary = primary or {}
+    documents = [{"path": document_input_path(0, input_format), "input_format": input_format, "filename": primary.get("filename"), "sheet": primary.get("sheet")}]
+    extra_inputs = []
+    for index, (raw, document) in enumerate(additional, start=1):
+        path = document_input_path(index, document["source_format"])
+        documents.append({"path": path, "input_format": document["source_format"], "filename": document.get("filename"), "sheet": document.get("sheet")})
+        extra_inputs.append((path, raw))
+    return execute_opensandbox_input(documents[0]["path"], document_bytes, wrapped_document_code(python_code, input_format, seed, documents), extra_inputs=tuple(extra_inputs))
 
 
 def output_figure_summary(execution: dict[str, Any], execution_ref: str) -> list[dict[str, Any]]:
@@ -922,14 +956,19 @@ def execute_python_preprocessing(args: dict[str, Any]) -> dict[str, Any]:
 
 def _execute_python_preprocessing(args: dict[str, Any]) -> dict[str, Any]:
     step = "execute_python_preprocessing"
-    unexpected = sorted(set(args) - {"document_ref", "python_code", "seed", "context", "_server_context"})
+    unexpected = sorted(set(args) - {"document_ref", "additional_document_refs", "python_code", "seed", "context", "_server_context"})
     if unexpected:
-        return error_response(step=step, error="unsupported tool arguments: " + ", ".join(unexpected), recoverable=False, instruction="Stop; pass only the declared document ref, Python source, and seed.")
+        return error_response(step=step, error="unsupported tool arguments: " + ", ".join(unexpected), recoverable=False, instruction="Stop; pass only the declared document refs, Python source, and seed.")
     document_ref = args.get("document_ref")
+    additional_refs = args.get("additional_document_refs") or []
     python_code = args.get("python_code")
     seed = args.get("seed", DEFAULT_SEED)
     if not isinstance(document_ref, str):
         return error_response(step=step, error="document_ref is required", recoverable=False, instruction="Stop; inspect an authorized uploaded dataset first.")
+    if (not isinstance(additional_refs, list) or len(additional_refs) > MAX_ADDITIONAL_DOCUMENTS
+            or any(not isinstance(ref, str) or not ref for ref in additional_refs)
+            or len(set(additional_refs)) != len(additional_refs) or document_ref in additional_refs):
+        return error_response(step=step, error=f"additional_document_refs must be up to {MAX_ADDITIONAL_DOCUMENTS} distinct document_refs other than document_ref", recoverable=False, instruction="Stop; inspect each uploaded dataset once and pass each returned document_ref once.")
     if not isinstance(python_code, str) or not python_code.strip():
         return error_response(step=step, error="python_code is required", recoverable=False, instruction="Stop; provide the confirmed Python preprocessing source.")
     code_bytes = python_code.encode("utf-8")
@@ -943,11 +982,24 @@ def _execute_python_preprocessing(args: dict[str, Any]) -> dict[str, Any]:
         input_format = document.get("source_format")
         if input_format not in {"csv", "xlsx"}:
             raise WorkflowContractError("uploaded document format is unsupported")
+        additional = tuple(read_authorized_document(context, ref) for ref in additional_refs)
+        upload_ids = [document["upload_id"], *(extra["upload_id"] for _raw, extra in additional)]
+        if len(set(upload_ids)) != len(upload_ids):
+            raise WorkflowContractError("each uploaded document may be passed only once")
+        for _raw, extra in additional:
+            # Each document is already owner-checked; one sandbox run must also
+            # stay inside one conversation's uploads.
+            if extra["session_id"] != document["session_id"]:
+                raise WorkflowContractError("all uploaded documents must belong to the same session")
+            if extra.get("source_format") not in {"csv", "xlsx"}:
+                raise WorkflowContractError("uploaded document format is unsupported")
+        if len(document_bytes) + sum(len(raw) for raw, _extra in additional) > MAX_COMBINED_DOCUMENT_BYTES:
+            raise WorkflowContractError(f"uploaded documents exceed {MAX_COMBINED_DOCUMENT_BYTES // (1024 * 1024)} MB combined")
     except (PermissionError, OSError, WorkflowContractError, ValueError, TypeError) as exc:
         return error_response(step=step, error=str(exc), recoverable=False, instruction="Stop; the uploaded document is invalid or unauthorized.")
     code_sha256 = hashlib.sha256(code_bytes).hexdigest()
     try:
-        execution = execute_document_opensandbox(document_bytes, input_format, python_code, seed)
+        execution = execute_document_opensandbox(document_bytes, input_format, python_code, seed, additional, document)
     except CancelledError:
         return error_response(step=step, error="preprocessing cancelled", recoverable=False,
                               instruction="Execution was cancelled; do not automatically restart it.", evidence={"effect_outcome": "cancelled"})
@@ -975,6 +1027,8 @@ def _execute_python_preprocessing(args: dict[str, Any]) -> dict[str, Any]:
         "input_document_ref": document_ref,
         "input_upload_id": document["upload_id"],
         "input_format": input_format,
+        "additional_input_document_refs": list(additional_refs),
+        "additional_input_upload_ids": [extra["upload_id"] for _raw, extra in additional],
         "input_fields": [],
         "seed": seed,
         "network": "deny",
@@ -1004,14 +1058,14 @@ def _execute_python_preprocessing(args: dict[str, Any]) -> dict[str, Any]:
     if execution_error:
         hint = python_error_hint(execution_error, python_code)
         return error_response(step=step, error=f"Python {hint['name']} at generated code lines {hint['line_numbers']}", recoverable=True,
-                              instruction="Python has finished with an error. Reuse the same document_ref with corrected complete code; raw exception values remain private.",
-                              evidence={"refs": refs, "document_ref": document_ref, "code_sha256": code_sha256, "python_error": hint})
+                              instruction="Python has finished with an error. Reuse the same document_ref and additional_document_refs with corrected complete code; raw exception values remain private.",
+                              evidence={"refs": refs, "document_ref": document_ref, "additional_document_refs": list(additional_refs), "code_sha256": code_sha256, "python_error": hint})
     return success_response(
         step=step,
         run_id=output_run_id,
         refs=refs,
         instruction="Reuse these outputs or derived_frame_ref within this session. Python outputs are not certified ML. Dashboard creation still requires authorized writing.",
-        evidence={"input_format": input_format, "source_sha256": document.get("source_sha256")},
+        evidence={"input_format": input_format, "source_sha256": document.get("source_sha256"), "additional_source_sha256": [extra.get("source_sha256") for _raw, extra in additional]},
         output_summary=summary,
         derived_frame_ref=derived_refs.get("derived_frame_ref"),
         derived_dataset_id=derived_summary.get("derived_dataset_id") if derived_summary else None,

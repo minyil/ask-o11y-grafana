@@ -227,3 +227,45 @@ func TestRedisSessionStore_IncrementStats_ConcurrentNoLostUpdates(t *testing.T) 
 		t.Fatalf("lost updates: TotalTokens = %d, want %d", got.TotalTokens, int64(concurrentRuns)*delta.TotalTokens)
 	}
 }
+
+func TestRedisSessionStore_UploadsListAndLegacyField(t *testing.T) {
+	client := createTestRedisClient(t)
+	defer client.Close()
+
+	store := NewRedisSessionStore(context.Background(), client, log.DefaultLogger, resolveTTLDays(0, DefaultSessionTTLDays))
+	session, err := store.CreateSession(1, 1, "test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A session saved before multi-file uploads carries the single legacy field.
+	legacy := `{"id":"` + session.ID + `","title":"test","messages":[],"userId":1,"orgId":1,"uploadDatasetId":"upload_00000000000000000000000000000000"}`
+	if err := client.Set(context.Background(), sessionKey(session.ID), legacy, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddUploadDatasetID(session.ID, 1, 1, "upload_11111111111111111111111111111111"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetSession(session.ID, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"upload_00000000000000000000000000000000", "upload_11111111111111111111111111111111"}
+	if fmt.Sprint(stored.UploadDatasetIDs) != fmt.Sprint(want) {
+		t.Fatalf("legacy upload not folded in: %v", stored.UploadDatasetIDs)
+	}
+	for i := 2; i < maxUploadsPerSession; i++ {
+		if err := store.AddUploadDatasetID(session.ID, 1, 1, fmt.Sprintf("upload_%032x", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.AddUploadDatasetID(session.ID, 1, 1, "upload_ffffffffffffffffffffffffffffffff"); err != ErrUploadLimit {
+		t.Fatalf("expected upload limit, got %v", err)
+	}
+	if err := store.RemoveUploadDatasetID(session.ID, 1, 1, want[0]); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ = store.GetSession(session.ID, 1, 1)
+	if len(stored.UploadDatasetIDs) != maxUploadsPerSession-1 || stored.UploadDatasetIDs[0] != want[1] {
+		t.Fatalf("legacy upload was not removable: %v", stored.UploadDatasetIDs)
+	}
+}

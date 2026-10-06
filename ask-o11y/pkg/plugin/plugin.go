@@ -1071,7 +1071,7 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 
 	var messages []agent.Message
 	var sessionID string
-	var uploadDatasetID string
+	var uploadDatasetIDs []string
 	runModel := requestedModel
 	modelSource := "auto"
 	if requestedModel != "" {
@@ -1085,7 +1085,7 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sessionID = req.SessionID
-		uploadDatasetID = session.UploadDatasetID
+		uploadDatasetIDs = session.UploadDatasetIDs
 		if session.Model != "" {
 			if requestedModel != "" && requestedModel != session.Model {
 				http.Error(w, "Session model cannot be changed", http.StatusBadRequest)
@@ -1217,7 +1217,7 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 		AuthToken:            saToken,
 		UserRole:             userRole,
 		UserID:               userID,
-		UploadDatasetID:      uploadDatasetID,
+		UploadDatasetIDs:     uploadDatasetIDs,
 		OrgID:                orgID,
 		OrgName:              req.OrgName,
 		ScopeOrgID:           req.ScopeOrgID,
