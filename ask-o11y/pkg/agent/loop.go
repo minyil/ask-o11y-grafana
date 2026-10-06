@@ -754,8 +754,14 @@ func (a *AgentLoop) executeTool(ctx context.Context, tc ToolCall, req LoopReques
 		return fmt.Sprintf("Tool %s is disabled in MCP server settings", tc.Function.Name), true, "tool"
 	}
 
+	// Empty arguments are a no-parameter call (see toolCallHasValidArgs); some
+	// models stream "" instead of "{}" for those.
+	rawArgs := strings.TrimSpace(tc.Function.Arguments)
+	if rawArgs == "" {
+		rawArgs = "{}"
+	}
 	var args map[string]interface{}
-	if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+	if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
 		return fmt.Sprintf("Invalid tool arguments: %v", err), true, "tool"
 	}
 	if args == nil {

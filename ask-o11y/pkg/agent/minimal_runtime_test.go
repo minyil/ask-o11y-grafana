@@ -77,3 +77,35 @@ func TestMinimalRuntimeKeepsWriteApprovalAndArgumentBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestExecuteToolTreatsEmptyArgumentsAsNoParameterCall(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/mcp/list-tools" {
+			_, _ = w.Write([]byte(`{"tools":[{"name":"list_things","inputSchema":{"type":"object"}}]}`))
+			return
+		}
+		calls++
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"listed"}]}`))
+	}))
+	defer server.Close()
+	loop, _, cleanup := setupTestLoop(t, nil)
+	defer cleanup()
+	defer loop.mcpProxy.Close()
+	servers := []mcp.ServerConfig{{ID: "reader", Type: "standard", URL: server.URL, Enabled: true}}
+	loop.mcpProxy.UpdateConfig(servers)
+	if _, err := loop.mcpProxy.ListTools(); err != nil {
+		t.Fatal(err)
+	}
+	req := LoopRequest{UserRole: "Admin", SessionID: "s", MCPServers: servers}
+	for _, arguments := range []string{"", "  "} {
+		tc := ToolCall{ID: "tc", Function: FunctionCall{Name: "reader_list_things", Arguments: arguments}}
+		if content, failed, _ := loop.executeTool(context.Background(), tc, req); failed {
+			t.Fatalf("empty arguments %q rejected: %s", arguments, content)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 tool calls, got %d", calls)
+	}
+}
