@@ -50,6 +50,8 @@ export type AppPluginSettings = {
   skills?: SkillsSettings;
 
   maxTotalTokens?: number;
+  /** Ceiling the agent may raise max_tokens to after a truncated tool call. */
+  maxCompletionTokens?: number;
   recentMessageCount?: number;
 
   /** Context-window management knobs (see agent.ContextLimits in pkg/agent). */

@@ -86,6 +86,7 @@ function getCollisionId(key: string): string | null {
 
 type State = {
   maxTotalTokens: number;
+  maxCompletionTokens: number;
   mcpServers: MCPServerConfig[];
   useBuiltInMCP: boolean;
   builtInMCPAvailable: boolean | null;
@@ -129,6 +130,10 @@ const PROMPT_DEFAULTS_URL = '/api/plugins/consensys-asko11y-app/resources/api/pr
 const DEFAULT_MAX_TOTAL_TOKENS = 128000;
 const MIN_TOTAL_TOKENS = 1000;
 const MAX_TOTAL_TOKENS = 200000;
+// Mirrors defaultCompletionTokenCeiling / minCompletionTokens in pkg/agent/loop.go.
+const DEFAULT_MAX_COMPLETION_TOKENS = 16384;
+const MIN_COMPLETION_TOKENS = 512;
+const MAX_COMPLETION_TOKENS = 128000;
 const BUILTIN_MCP_SERVER_ID = 'mcp-grafana';
 const DEFAULT_SERVICE_GRAPH_MAX_NODES = 100;
 const DEFAULT_SERVICE_GRAPH_MAX_EDGES = 200;
@@ -275,6 +280,7 @@ const AppConfig = ({ plugin }: AppConfigProps) => {
   const [topologyError, setTopologyError] = useState<string | null>(null);
   const [state, setState] = useState<State>({
     maxTotalTokens: jsonData?.maxTotalTokens || DEFAULT_MAX_TOTAL_TOKENS,
+    maxCompletionTokens: jsonData?.maxCompletionTokens || DEFAULT_MAX_COMPLETION_TOKENS,
     mcpServers: (jsonData?.mcpServers || []).map((server) => ({
       ...server,
       trusted: server.trusted ?? jsonData?.trustedMCPServers?.[server.id] ?? false,
@@ -375,7 +381,11 @@ const AppConfig = ({ plugin }: AppConfigProps) => {
   }, []);
 
   const isLLMSettingsDisabled = Boolean(
-    !state.maxTotalTokens || state.maxTotalTokens < MIN_TOTAL_TOKENS || state.maxTotalTokens > MAX_TOTAL_TOKENS
+    !state.maxTotalTokens ||
+      state.maxTotalTokens < MIN_TOTAL_TOKENS ||
+      state.maxTotalTokens > MAX_TOTAL_TOKENS ||
+      state.maxCompletionTokens < MIN_COMPLETION_TOKENS ||
+      state.maxCompletionTokens > MAX_COMPLETION_TOKENS
   );
   const isAgentRuntimeDisabled = state.maxParallelToolCalls < 1 || state.maxParallelToolCalls > 16;
   const isContextManagementInvalid =
@@ -435,6 +445,7 @@ const AppConfig = ({ plugin }: AppConfigProps) => {
     return {
       general:
         state.maxTotalTokens !== (savedJsonData.maxTotalTokens || DEFAULT_MAX_TOTAL_TOKENS) ||
+        state.maxCompletionTokens !== (savedJsonData.maxCompletionTokens || DEFAULT_MAX_COMPLETION_TOKENS) ||
         state.kioskModeEnabled !== (savedJsonData.kioskModeEnabled ?? true) ||
         state.chatPanelPosition !== (savedJsonData.chatPanelPosition || 'right'),
       'agent-runtime':
@@ -949,6 +960,7 @@ const AppConfig = ({ plugin }: AppConfigProps) => {
       jsonData: {
         ...savedJsonData,
         maxTotalTokens: state.maxTotalTokens,
+        maxCompletionTokens: state.maxCompletionTokens,
       },
     });
   }
@@ -1129,6 +1141,28 @@ const AppConfig = ({ plugin }: AppConfigProps) => {
                 max={MAX_TOTAL_TOKENS}
                 onChange={onChange}
                 invalid={!!validationErrors.maxTotalTokens}
+              />
+            </Field>
+
+            <Field
+              label="Max Completion Tokens"
+              description={`Upper limit the agent may raise each response to when the model is cut off mid tool call; it starts lower and grows only when needed, and never exceeds half of Max Total Tokens (minimum: ${MIN_COMPLETION_TOKENS}, maximum: ${MAX_COMPLETION_TOKENS}, default: ${DEFAULT_MAX_COMPLETION_TOKENS})`}
+              invalid={
+                state.maxCompletionTokens < MIN_COMPLETION_TOKENS || state.maxCompletionTokens > MAX_COMPLETION_TOKENS
+              }
+              error={`Must be between ${MIN_COMPLETION_TOKENS} and ${MAX_COMPLETION_TOKENS}`}
+            >
+              <Input
+                width={60}
+                name="maxCompletionTokens"
+                id="config-max-completion-tokens"
+                data-testid={testIds.appConfig.maxCompletionTokens}
+                type="number"
+                value={state.maxCompletionTokens}
+                placeholder={String(DEFAULT_MAX_COMPLETION_TOKENS)}
+                min={MIN_COMPLETION_TOKENS}
+                max={MAX_COMPLETION_TOKENS}
+                onChange={onChange}
               />
             </Field>
 

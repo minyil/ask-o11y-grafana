@@ -103,6 +103,9 @@ type PluginSettings struct {
 
 	MaxTotalTokens     int `json:"maxTotalTokens,omitempty"`
 	RecentMessageCount int `json:"recentMessageCount,omitempty"`
+	// MaxCompletionTokens caps how far the agent may raise max_tokens after the
+	// model is cut off mid tool call. 0 uses the agent default.
+	MaxCompletionTokens int `json:"maxCompletionTokens,omitempty"`
 
 	BuiltInMCPBaseURL string `json:"builtInMCPBaseURL,omitempty"`
 	// UseLocalGrafanaURL routes backend-to-backend LLM and built-in MCP requests
@@ -1166,19 +1169,20 @@ func (p *Plugin) handleAgentRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	loopReq := agent.LoopRequest{
-		Messages:           messages,
-		SystemPrompt:       systemPrompt,
-		MaxTotalTokens:     p.settings.MaxTotalTokens,
-		RecentMessageCount: p.settings.RecentMessageCount,
-		ContextLimits:      contextLimitsFromSettings(p.settings),
-		MaxIterations:      maxIterations,
-		Model:              effectiveRunModel,
-		AllowModelFallback: (modelSource == "auto" || modelSource == "skill") && effectiveRunModel == "large",
-		ConversationType:   req.Type,
-		RunID:              runID,
-		SessionID:          sessionID,
-		ActiveSkillsEvent:  skillEventInfos(activation.Skills),
-		AvailableSkills:    skillSpecs(toolCtx.SkillsCatalog),
+		Messages:            messages,
+		SystemPrompt:        systemPrompt,
+		MaxTotalTokens:      p.settings.MaxTotalTokens,
+		MaxCompletionTokens: p.settings.MaxCompletionTokens,
+		RecentMessageCount:  p.settings.RecentMessageCount,
+		ContextLimits:       contextLimitsFromSettings(p.settings),
+		MaxIterations:       maxIterations,
+		Model:               effectiveRunModel,
+		AllowModelFallback:  (modelSource == "auto" || modelSource == "skill") && effectiveRunModel == "large",
+		ConversationType:    req.Type,
+		RunID:               runID,
+		SessionID:           sessionID,
+		ActiveSkillsEvent:   skillEventInfos(activation.Skills),
+		AvailableSkills:     skillSpecs(toolCtx.SkillsCatalog),
 		LoadSkill: func(ctx context.Context, name, file string) (string, error) {
 			return p.skillRegistry.Load(name, file, toolCtx)
 		},
@@ -2155,23 +2159,24 @@ func (p *Plugin) handleGraphitiDiscover(w http.ResponseWriter, r *http.Request) 
 	p.runStore.CreateRun(runID, userID, orgID)
 
 	loopReq := agent.LoopRequest{
-		Messages:           []agent.Message{{Role: "user", Content: GraphitiDiscoveryMessage}},
-		SystemPrompt:       GraphitiDiscoverySystemPrompt,
-		MaxTotalTokens:     p.settings.MaxTotalTokens,
-		RecentMessageCount: p.settings.RecentMessageCount,
-		ContextLimits:      contextLimitsFromSettings(p.settings),
-		MaxIterations:      GraphitiDiscoveryMaxIter,
-		Model:              agentModelLarge,
-		GrafanaURL:         grafanaURL,
-		AuthToken:          saToken,
-		UserRole:           userRole,
-		UserID:             userID,
-		OrgID:              strconv.FormatInt(orgID, 10),
-		OrgName:            "Org" + strconv.FormatInt(orgID, 10),
-		ExcludeToolNames:   graphitiWriteToolNames,
-		MCPServers:         p.settingsForFilter(),
-		ConversationType:   "discovery",
-		ApprovalPolicy:     "off",
+		Messages:            []agent.Message{{Role: "user", Content: GraphitiDiscoveryMessage}},
+		SystemPrompt:        GraphitiDiscoverySystemPrompt,
+		MaxTotalTokens:      p.settings.MaxTotalTokens,
+		MaxCompletionTokens: p.settings.MaxCompletionTokens,
+		RecentMessageCount:  p.settings.RecentMessageCount,
+		ContextLimits:       contextLimitsFromSettings(p.settings),
+		MaxIterations:       GraphitiDiscoveryMaxIter,
+		Model:               agentModelLarge,
+		GrafanaURL:          grafanaURL,
+		AuthToken:           saToken,
+		UserRole:            userRole,
+		UserID:              userID,
+		OrgID:               strconv.FormatInt(orgID, 10),
+		OrgName:             "Org" + strconv.FormatInt(orgID, 10),
+		ExcludeToolNames:    graphitiWriteToolNames,
+		MCPServers:          p.settingsForFilter(),
+		ConversationType:    "discovery",
+		ApprovalPolicy:      "off",
 	}
 
 	eventCh := make(chan agent.SSEEvent, GraphitiDiscoveryMaxIter*6)

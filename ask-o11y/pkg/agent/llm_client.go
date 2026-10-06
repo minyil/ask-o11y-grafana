@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"slices"
@@ -26,6 +27,9 @@ const (
 	maxSSELineSize    = 1 * 1024 * 1024 // 1 MB — large tool-call payloads (e.g. dashboard JSON) can exceed bufio's 64 KB default
 	maxLLMAttempts    = 2
 	llmRetryBaseDelay = 250 * time.Millisecond
+	// maxErrorDetailBytes caps how much of a non-OK response body is kept on
+	// LLMHTTPError for logging and classification.
+	maxErrorDetailBytes = 1024
 )
 
 // errIncompleteStream is returned by parseStream when the SSE stream ends without
@@ -46,6 +50,9 @@ type LLMHTTPError struct {
 	MaxTokens    int
 	RequestBytes int
 	Retryable    bool
+	// Detail is the leading part of the provider's error body. It is logged and
+	// used to classify the failure, but never shown to end users.
+	Detail string
 }
 
 func (e *LLMHTTPError) Error() string {
@@ -204,6 +211,7 @@ func (c *LLMClient) ChatCompletion(ctx context.Context, req ChatCompletionReques
 				"toolCount", llmErr.ToolCount,
 				"maxTokens", llmErr.MaxTokens,
 				"requestBytes", llmErr.RequestBytes,
+				"detail", llmErr.Detail,
 				"attempt", attempt)
 			if llmErr.Retryable && attempt < maxLLMAttempts {
 				if !sleepWithContext(ctx, retryDelay(resp, attempt)) {
@@ -243,6 +251,7 @@ func (c *LLMClient) ChatCompletion(ctx context.Context, req ChatCompletionReques
 
 func (c *LLMClient) buildHTTPError(resp *http.Response, req ChatCompletionRequest, requestBytes int) *LLMHTTPError {
 	requestID, traceID := llmDiagnosticHeaders(resp.Header)
+	detail, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorDetailBytes))
 	return &LLMHTTPError{
 		StatusCode:   resp.StatusCode,
 		Status:       resp.Status,
@@ -254,7 +263,25 @@ func (c *LLMClient) buildHTTPError(resp *http.Response, req ChatCompletionReques
 		MaxTokens:    req.MaxTokens,
 		RequestBytes: requestBytes,
 		Retryable:    isRetryableLLMStatus(resp.StatusCode),
+		Detail:       strings.TrimSpace(string(detail)),
 	}
+}
+
+// isMaxTokensRejection reports whether err is a 400 caused by the requested
+// max_tokens exceeding what the model allows (its output limit, or what is left
+// of its context window). Shrinking max_tokens and retrying can fix these.
+func isMaxTokensRejection(err error) bool {
+	var llmErr *LLMHTTPError
+	if !errors.As(err, &llmErr) || llmErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	detail := strings.ToLower(llmErr.Detail)
+	for _, marker := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens", "maximum context length", "output tokens"} {
+		if strings.Contains(detail, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func llmDiagnosticHeaders(headers http.Header) (requestID, traceID string) {

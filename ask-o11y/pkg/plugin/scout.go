@@ -185,20 +185,21 @@ func (s *Scout) Scavenge() {
 	}
 
 	loopReq := agent.LoopRequest{
-		Messages:           []agent.Message{{Role: "user", Content: s.discoveryMessage()}},
-		SystemPrompt:       GraphitiDiscoverySystemPrompt,
-		MaxTotalTokens:     s.settings.MaxTotalTokens,
-		RecentMessageCount: s.settings.RecentMessageCount,
-		ContextLimits:      contextLimitsFromSettings(s.settings),
-		MaxIterations:      GraphitiDiscoveryMaxIter,
-		Model:              agentModelLarge,
-		GrafanaURL:         grafanaURL,
-		AuthToken:          saToken,
-		OrgID:              fmt.Sprintf("%d", orgID),
-		OrgName:            fmt.Sprintf("Org%d", orgID),
-		ExcludeToolNames:   graphitiWriteToolNames,
-		ConversationType:   "discovery",
-		ApprovalPolicy:     "off",
+		Messages:            []agent.Message{{Role: "user", Content: s.discoveryMessage()}},
+		SystemPrompt:        GraphitiDiscoverySystemPrompt,
+		MaxTotalTokens:      s.settings.MaxTotalTokens,
+		MaxCompletionTokens: s.settings.MaxCompletionTokens,
+		RecentMessageCount:  s.settings.RecentMessageCount,
+		ContextLimits:       contextLimitsFromSettings(s.settings),
+		MaxIterations:       GraphitiDiscoveryMaxIter,
+		Model:               agentModelLarge,
+		GrafanaURL:          grafanaURL,
+		AuthToken:           saToken,
+		OrgID:               fmt.Sprintf("%d", orgID),
+		OrgName:             fmt.Sprintf("Org%d", orgID),
+		ExcludeToolNames:    graphitiWriteToolNames,
+		ConversationType:    "discovery",
+		ApprovalPolicy:      "off",
 	}
 
 	eventCh := make(chan agent.SSEEvent, GraphitiDiscoveryMaxIter*6)

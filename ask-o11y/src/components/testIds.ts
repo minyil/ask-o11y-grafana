@@ -10,6 +10,7 @@ export const testIds = {
     settingsTabPanel: (id: string) => `data-testid ac-settings-tab-panel-${id}`,
     unsavedChangesNotice: 'data-testid ac-unsaved-changes-notice',
     maxTotalTokens: 'data-testid ac-max-total-tokens',
+    maxCompletionTokens: 'data-testid ac-max-completion-tokens',
     submit: 'data-testid ac-submit-form',
     useBuiltInMCPToggle: 'data-testid ac-use-builtin-mcp-toggle',
     addMcpServerButton: 'data-testid ac-add-mcp-server',

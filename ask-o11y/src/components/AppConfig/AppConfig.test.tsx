@@ -129,6 +129,19 @@ describe('Components/AppConfig', () => {
     expect(screen.getByText('MCP *')).toBeInTheDocument();
   });
 
+  test('disables saving LLM settings when max completion tokens is out of range', () => {
+    render(<AppConfig {...props} />);
+
+    const input = screen.getByTestId(testIds.appConfig.maxCompletionTokens);
+    expect(input).toHaveValue(16384);
+    expect(screen.getByTestId(testIds.appConfig.submit)).toBeEnabled();
+
+    fireEvent.change(input, { target: { value: '100' } });
+
+    expect(screen.getByTestId(testIds.appConfig.submit)).toBeDisabled();
+    expect(screen.getByText('General *')).toBeInTheDocument();
+  });
+
   test('restores the active settings tab from session storage', () => {
     window.sessionStorage.setItem(SETTINGS_TAB_STORAGE_KEY, 'prompts');
 

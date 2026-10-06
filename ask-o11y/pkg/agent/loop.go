@@ -23,14 +23,23 @@ const defaultMaxIterations = 25
 const defaultMaxCompletionTokens = 4096
 const minCompletionTokens = 512
 
+// defaultCompletionTokenCeiling bounds how far the per-run completion budget may
+// grow after the model is cut off mid tool call (finish_reason=length), when the
+// admin hasn't set LoopRequest.MaxCompletionTokens. Runs start at the
+// conservative completionTokenBudget so a model with a small output limit isn't
+// rejected up front; only runs that actually hit the limit pay for more room.
+const defaultCompletionTokenCeiling = 16384
+
 // nearLimitWarning is injected as a one-shot system message on the second-to-last
 // iteration to steer the LLM toward a honest final answer instead of fabricating
 // around missing data when the loop is about to abort at maxIter.
 const nearLimitWarning = "[SYSTEM: You are approaching the iteration limit. Produce a final answer NOW based ONLY on tool results you have actually retrieved this session. If you lack data, say so explicitly — do not fabricate.]"
 
 // maxTruncationRetries bounds how many times, per run, the loop will nudge the
-// model to reissue a tool call whose arguments arrived truncated/invalid. Beyond
-// this the run ends with a clean, retryable error instead of spinning.
+// model to reissue a tool call whose arguments arrived truncated/invalid once the
+// completion budget can no longer grow (retries that raise the budget don't
+// count). Beyond this the run ends with a clean, retryable error instead of
+// spinning.
 const maxTruncationRetries = 1
 
 // loadSkillToolName is the internal (non-MCP) tool the loop advertises when
@@ -76,6 +85,11 @@ type LoopRequest struct {
 	Model              string
 	AllowModelFallback bool
 	ConversationType   string
+
+	// MaxCompletionTokens caps how far the completion budget may grow after a
+	// truncated tool call. <= 0 uses defaultCompletionTokenCeiling. It is always
+	// further limited to half of MaxTotalTokens.
+	MaxCompletionTokens int
 
 	// ContextLimits carries the admin-configurable context-window knobs (trim
 	// caps, eviction threshold, eviction summarization on/off). Zero value
@@ -136,8 +150,7 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 		maxTokens = DefaultMaxTotalTokens
 	}
 	limits := req.ContextLimits.withDefaults()
-	completionBudget := completionTokenBudget(maxTokens)
-	promptBudget := maxTokens - completionBudget
+	budget := newCompletionBudget(maxTokens, req.MaxCompletionTokens)
 
 	mcpTools, err := a.mcpProxy.ListToolsWithContext(mcp.WithUserID(ctx, req.UserID))
 	if err != nil {
@@ -238,7 +251,7 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 		}, func(toolCallID string) bool {
 			return toolResultIsError[toolCallID]
 		})
-		messages = TrimMessagesToTokenLimit(messages, openAITools, promptBudget, limits)
+		messages = TrimMessagesToTokenLimit(messages, openAITools, maxTokens-budget.current, limits)
 
 		a.logger.Debug("Agent loop iteration",
 			"iteration", iteration,
@@ -266,9 +279,24 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 			Model:     req.Model,
 			Messages:  callMessages,
 			Tools:     openAITools,
-			MaxTokens: completionBudget,
+			MaxTokens: budget.current,
 		}
 		resp, effectiveModel, err := a.chatCompletionWithFallback(ctx, llmReq, req)
+		// The provider rejected max_tokens as too large for this model (e.g. after
+		// switching to a model with a smaller output limit). Shrink and retry; the
+		// lowered ceiling sticks for the rest of the run.
+		for err != nil && isMaxTokensRejection(err) && ctx.Err() == nil {
+			rejected := budget.current
+			if !budget.shrink() {
+				break
+			}
+			a.logger.Warn("LLM rejected completion budget; retrying with a smaller one",
+				"rejected", rejected,
+				"retryWith", budget.current,
+				"iteration", iteration)
+			llmReq.MaxTokens = budget.current
+			resp, effectiveModel, err = a.chatCompletionWithFallback(ctx, llmReq, req)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -306,7 +334,7 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 					"dropped", dropped,
 					"kept", len(validCalls),
 					"finishReason", resp.Choices[0].FinishReason,
-					"completionBudget", completionBudget,
+					"completionBudget", budget.current,
 					"iteration", iteration)
 				msg.ToolCalls = validCalls
 			}
@@ -317,9 +345,24 @@ func (a *AgentLoop) Run(ctx context.Context, req LoopRequest, eventCh chan<- SSE
 			// iteration is left to retry in, in which case surface a clean,
 			// retryable error instead of the generic max-iterations one.
 			if dropped > 0 && len(validCalls) == 0 {
+				// Cut off by the output limit: retry with more room rather than
+				// asking the model to squeeze the same call into the same budget.
+				if iteration < maxIter-1 && resp.Choices[0].FinishReason == "length" {
+					previous := budget.current
+					if budget.grow() {
+						a.logger.Info("LLM hit completion budget mid tool call; raising budget",
+							"from", previous,
+							"to", budget.current,
+							"iteration", iteration)
+						pendingTruncationNudge = true
+						continue
+					}
+				}
 				if truncationRetries >= maxTruncationRetries || iteration >= maxIter-1 {
 					a.logger.Warn("LLM truncated tool calls with no viable retry; aborting run",
 						"retries", truncationRetries,
+						"completionBudget", budget.current,
+						"completionCeiling", budget.ceiling,
 						"iteration", iteration)
 					a.send(ctx, eventCh, SSEEvent{
 						Type: "error",
@@ -638,6 +681,52 @@ func completionTokenBudget(maxTotalTokens int) int {
 		budget = defaultMaxCompletionTokens
 	}
 	return budget
+}
+
+// completionBudget is the per-run max_tokens sent to the LLM. It starts at the
+// conservative completionTokenBudget, doubles (up to ceiling) when the model is
+// cut off mid tool call, and halves when the provider rejects it as too large.
+type completionBudget struct {
+	current int
+	ceiling int
+}
+
+func newCompletionBudget(maxTotalTokens, configuredCeiling int) *completionBudget {
+	ceiling := configuredCeiling
+	if ceiling <= 0 {
+		ceiling = defaultCompletionTokenCeiling
+	}
+	// Never let the completion crowd out more than half of the context window.
+	if half := maxTotalTokens / 2; half > 0 && ceiling > half {
+		ceiling = half
+	}
+	current := completionTokenBudget(maxTotalTokens)
+	if current > ceiling {
+		current = ceiling
+	}
+	return &completionBudget{current: current, ceiling: ceiling}
+}
+
+// grow doubles the budget up to the ceiling. It reports false when the budget
+// is already at the ceiling.
+func (b *completionBudget) grow() bool {
+	if b.current >= b.ceiling {
+		return false
+	}
+	b.current = min(b.current*2, b.ceiling)
+	return true
+}
+
+// shrink halves the budget (not below minCompletionTokens) after the provider
+// rejected the current value, and lowers the ceiling so later growth never
+// returns to a rejected size. It reports false when the budget can't shrink.
+func (b *completionBudget) shrink() bool {
+	if b.current <= minCompletionTokens {
+		return false
+	}
+	b.current = max(b.current/2, minCompletionTokens)
+	b.ceiling = b.current
+	return true
 }
 
 func (a *AgentLoop) executeTool(ctx context.Context, tc ToolCall, req LoopRequest) (content string, isError bool, errorKind string) {

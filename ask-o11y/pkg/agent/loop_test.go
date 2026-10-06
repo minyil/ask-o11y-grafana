@@ -455,6 +455,52 @@ func TestCompletionTokenBudget(t *testing.T) {
 	}
 }
 
+func TestCompletionBudget(t *testing.T) {
+	t.Run("starts conservative and grows to the default ceiling", func(t *testing.T) {
+		b := newCompletionBudget(64000, 0)
+		if b.current != defaultMaxCompletionTokens || b.ceiling != defaultCompletionTokenCeiling {
+			t.Fatalf("got current=%d ceiling=%d", b.current, b.ceiling)
+		}
+		var steps []int
+		for b.grow() {
+			steps = append(steps, b.current)
+		}
+		if fmt.Sprint(steps) != "[8192 16384]" {
+			t.Fatalf("growth steps = %v, want [8192 16384]", steps)
+		}
+	})
+
+	t.Run("ceiling never exceeds half of the total", func(t *testing.T) {
+		b := newCompletionBudget(20000, 50000)
+		if b.ceiling != 10000 {
+			t.Fatalf("ceiling = %d, want 10000", b.ceiling)
+		}
+	})
+
+	t.Run("configured ceiling below the start lowers the start", func(t *testing.T) {
+		b := newCompletionBudget(64000, 2048)
+		if b.current != 2048 || b.grow() {
+			t.Fatalf("got current=%d, expected 2048 with no room to grow", b.current)
+		}
+	})
+
+	t.Run("shrink halves, lowers the ceiling and stops at the minimum", func(t *testing.T) {
+		b := newCompletionBudget(64000, 0)
+		b.grow() // 8192
+		if !b.shrink() || b.current != 4096 || b.ceiling != 4096 {
+			t.Fatalf("after shrink: current=%d ceiling=%d", b.current, b.ceiling)
+		}
+		if b.grow() {
+			t.Fatal("grow must not return to a rejected size")
+		}
+		for b.shrink() {
+		}
+		if b.current != minCompletionTokens {
+			t.Fatalf("current = %d, want %d", b.current, minCompletionTokens)
+		}
+	})
+}
+
 func TestEnsureScopedGraphitiArgs(t *testing.T) {
 	tool := mcp.Tool{
 		Name: "graphiti_search_memory_facts",
@@ -735,9 +781,15 @@ func TestAgentLoop_TruncatedToolCall_AbortsAfterRetryCap(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	// initial call + maxTruncationRetries corrective retries.
-	if callCount != maxTruncationRetries+1 {
-		t.Fatalf("expected %d LLM calls, got %d", maxTruncationRetries+1, callCount)
+	// initial call + one retry per budget doubling + maxTruncationRetries
+	// corrective retries once the budget is at its ceiling.
+	budget := newCompletionBudget(DefaultMaxTotalTokens, 0)
+	growths := 0
+	for budget.grow() {
+		growths++
+	}
+	if want := 1 + growths + maxTruncationRetries; callCount != want {
+		t.Fatalf("expected %d LLM calls, got %d", want, callCount)
 	}
 
 	last := events[len(events)-1]
@@ -750,6 +802,143 @@ func TestAgentLoop_TruncatedToolCall_AbortsAfterRetryCap(t *testing.T) {
 	}
 	if errEvent.Code != "llm_truncated_tool_call" || !errEvent.Retryable {
 		t.Fatalf("unexpected error event: %+v", errEvent)
+	}
+}
+
+func TestAgentLoop_TruncatedToolCall_RaisesCompletionBudget(t *testing.T) {
+	// finish_reason=length mid tool call means the output limit was too small:
+	// the retry must ask for more room instead of the same max_tokens.
+	var mu sync.Mutex
+	var maxTokens []int
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body ChatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		mu.Lock()
+		maxTokens = append(maxTokens, body.MaxTokens)
+		first := len(maxTokens) == 1
+		mu.Unlock()
+
+		if first {
+			respondAsStream(w, ChatCompletionResponse{
+				ID: "trunc",
+				Choices: []Choice{{
+					Message: Message{
+						Role: "assistant",
+						ToolCalls: []ToolCall{{
+							ID: "tc_trunc", Type: "function",
+							Function: FunctionCall{Name: "update_dashboard", Arguments: `{"uid": "feve`},
+						}},
+					},
+					FinishReason: "length",
+				}},
+			})
+			return
+		}
+		respondAsStream(w, ChatCompletionResponse{
+			ID:      "ok",
+			Choices: []Choice{{Message: Message{Role: "assistant", Content: "done"}, FinishReason: "stop"}},
+		})
+	}))
+	defer llmServer.Close()
+
+	loop := NewAgentLoop(NewLLMClient(log.DefaultLogger, &http.Client{Timeout: llmTimeout}),
+		mcp.NewProxy(context.Background(), log.DefaultLogger), log.DefaultLogger)
+	eventCh := make(chan SSEEvent, 32)
+	go loop.Run(context.Background(), LoopRequest{
+		Messages:     []Message{{Role: "user", Content: "do it"}},
+		SystemPrompt: "sys",
+		GrafanaURL:   llmServer.URL,
+		AuthToken:    "test-token",
+		UserRole:     "Admin",
+		OrgID:        "1",
+	}, eventCh)
+	events := collectEvents(eventCh)
+
+	if last := events[len(events)-1]; last.Type != "done" {
+		t.Fatalf("expected done, got %q (events: %+v)", last.Type, events)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(maxTokens) != fmt.Sprint([]int{defaultMaxCompletionTokens, 2 * defaultMaxCompletionTokens}) {
+		t.Fatalf("max_tokens per call = %v, want [%d %d]", maxTokens, defaultMaxCompletionTokens, 2*defaultMaxCompletionTokens)
+	}
+}
+
+func TestAgentLoop_MaxTokensRejected_ShrinksAndRetries(t *testing.T) {
+	// A model whose output limit is below our budget rejects the request with a
+	// 400. The loop must shrink max_tokens and retry instead of failing the run.
+	const modelOutputLimit = 2048
+	var mu sync.Mutex
+	var maxTokens []int
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body ChatCompletionRequest
+		json.NewDecoder(r.Body).Decode(&body) //nolint:errcheck
+		mu.Lock()
+		maxTokens = append(maxTokens, body.MaxTokens)
+		mu.Unlock()
+
+		if body.MaxTokens > modelOutputLimit {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"error":{"message":"max_tokens: %d > %d, which is the maximum allowed number of output tokens"}}`, body.MaxTokens, modelOutputLimit)
+			return
+		}
+		respondAsStream(w, ChatCompletionResponse{
+			ID:      "ok",
+			Choices: []Choice{{Message: Message{Role: "assistant", Content: "done"}, FinishReason: "stop"}},
+		})
+	}))
+	defer llmServer.Close()
+
+	loop := NewAgentLoop(NewLLMClient(log.DefaultLogger, &http.Client{Timeout: llmTimeout}),
+		mcp.NewProxy(context.Background(), log.DefaultLogger), log.DefaultLogger)
+	eventCh := make(chan SSEEvent, 32)
+	go loop.Run(context.Background(), LoopRequest{
+		Messages:     []Message{{Role: "user", Content: "hi"}},
+		SystemPrompt: "sys",
+		GrafanaURL:   llmServer.URL,
+		AuthToken:    "test-token",
+		UserRole:     "Admin",
+		OrgID:        "1",
+	}, eventCh)
+	events := collectEvents(eventCh)
+
+	if last := events[len(events)-1]; last.Type != "done" {
+		t.Fatalf("expected done, got %q (events: %+v)", last.Type, events)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(maxTokens) != fmt.Sprint([]int{defaultMaxCompletionTokens, defaultMaxCompletionTokens / 2}) {
+		t.Fatalf("max_tokens per call = %v", maxTokens)
+	}
+}
+
+func TestAgentLoop_UnrelatedBadRequest_NotRetried(t *testing.T) {
+	var calls atomic.Int32
+	llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"message":"messages: roles must alternate"}}`)) //nolint:errcheck
+	}))
+	defer llmServer.Close()
+
+	loop := NewAgentLoop(NewLLMClient(log.DefaultLogger, &http.Client{Timeout: llmTimeout}),
+		mcp.NewProxy(context.Background(), log.DefaultLogger), log.DefaultLogger)
+	eventCh := make(chan SSEEvent, 32)
+	go loop.Run(context.Background(), LoopRequest{
+		Messages:     []Message{{Role: "user", Content: "hi"}},
+		SystemPrompt: "sys",
+		GrafanaURL:   llmServer.URL,
+		AuthToken:    "test-token",
+		UserRole:     "Admin",
+		OrgID:        "1",
+	}, eventCh)
+	events := collectEvents(eventCh)
+
+	if last := events[len(events)-1]; last.Type != "error" {
+		t.Fatalf("expected error, got %q", last.Type)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 LLM call, got %d", got)
 	}
 }
 
