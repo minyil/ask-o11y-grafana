@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"consensys-asko11y-app/pkg/mcp"
 )
@@ -83,5 +84,25 @@ func TestDashboardWriterResolvesWithoutReturningFigureToModel(t *testing.T) {
 	tc.Function.Name = artifactBridgeResolveTool
 	if _, failed, _ := loop.executeTool(context.Background(), tc, req); !failed || bound != 1 {
 		t.Fatal("model called the host-only resolver")
+	}
+}
+
+func TestBindingResolutionErrorRelaysOnlyRecoverableContractErrors(t *testing.T) {
+	err := bindingResolutionError(`{"ok":false,"error":"plotly binding must have exactly the keys placeholder, $execution_ref, output_index, plugin_id; got [execution_ref output_index placeholder plugin_id]","recoverable":true,"instruction":"Revise only the dashboard binding placeholders."}`)
+	if !strings.Contains(err.Error(), "no dashboard was written: plotly binding must have exactly the keys placeholder, $execution_ref") || !strings.Contains(err.Error(), "Revise only") {
+		t.Fatalf("contract error was not relayed: %v", err)
+	}
+	for _, text := range []string{
+		`{"ok":false,"error":"unauthorized artifact access: secret detail","recoverable":false}`,
+		`not json`,
+		`{"ok":false,"recoverable":true}`,
+	} {
+		if got := bindingResolutionError(text).Error(); got != "artifact binding resolution failed; no dashboard was written" {
+			t.Fatalf("non-recoverable detail leaked for %q: %s", text, got)
+		}
+	}
+	long := strings.Repeat("錯", 400)
+	if got := bindingResolutionError(`{"error":"` + long + `","recoverable":true}`).Error(); !strings.HasSuffix(got, "…") || !utf8.ValidString(got) {
+		t.Fatalf("long detail was not truncated safely: %d bytes", len(got))
 	}
 }
