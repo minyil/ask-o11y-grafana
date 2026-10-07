@@ -182,7 +182,7 @@ def resolve_plotly_bindings(context: dict[str, str], panel: dict[str, Any], coun
                 raise WorkflowContractError("plotly output index does not exist") from exc
             sanitized = _plotly_figure(result)
         else:
-            raise WorkflowContractError("plotly binding requires only placeholder, execution ref, output index, and plugin id")
+            raise WorkflowContractError(f"plotly binding must have exactly the keys placeholder, $execution_ref, output_index, plugin_id; got {sorted(binding)}")
         placeholder_name = placeholder[1:] if isinstance(placeholder, str) and placeholder.startswith("$") else ""
         if not placeholder_name or not placeholder_name[0].isalpha() or not all(char.isalnum() or char in "_-" for char in placeholder_name):
             raise WorkflowContractError("plotly placeholder must be a $-prefixed identifier containing only letters, digits, underscores, or hyphens")
@@ -229,7 +229,7 @@ def resolve_asset_bindings(context: dict[str, str], panel: dict[str, Any], count
             if not isinstance(mime, dict) or not isinstance(mime.get("image/png"), str):
                 raise WorkflowContractError("dashboard asset binding currently requires image/png")
         else:
-            raise WorkflowContractError("asset binding requires only placeholder, execution ref, and output index")
+            raise WorkflowContractError(f"asset binding must have exactly the keys placeholder, $execution_ref, output_index; got {sorted(binding)}")
         if not isinstance(placeholder, str) or not placeholder.startswith("$asset_url_") or not placeholder.removeprefix("$asset_url_").replace("_", "").replace("-", "").isalnum():
             raise WorkflowContractError("asset placeholder must start with $asset_url_ and contain only letters, digits, or underscores")
         asset_url = artifact_assets.sign_output_url(
@@ -301,8 +301,12 @@ def resolve_dashboard_refs(args: dict[str, Any]) -> dict[str, Any]:
         output["panels"] = resolve_panels(context, output.get("panels", []), counters)
     except (ArtifactAuthError, PermissionError) as exc:
         return error_response(step=step, error=f"unauthorized artifact access: {exc}", recoverable=False, instruction="Stop; the opaque dashboard binding is not authorized for this context.")
-    except (WorkflowContractError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+    except WorkflowContractError as exc:
+        # Contract messages are model-correctable and safe to relay; the host forwards them verbatim.
         return error_response(step=step, error=str(exc), recoverable=True, instruction="Revise only the dashboard binding placeholders; do not rerun successful query or analysis work.")
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        # Raw exception text can carry host paths; keep it private.
+        return error_response(step=step, error="dashboard binding could not be resolved", recoverable=True, instruction="Check that each $execution_ref and output_index was returned by a successful analysis; do not rerun successful query or analysis work.")
     return success_response(
         step=step,
         run_id="run_" + uuid.uuid4().hex,

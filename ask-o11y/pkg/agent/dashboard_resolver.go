@@ -40,8 +40,11 @@ func (a *AgentLoop) resolveDashboardBindings(ctx context.Context, args map[strin
 	result, err := a.mcpProxy.CallToolWithContext(req.toolContext(ctx), artifactBridgeResolveTool,
 		map[string]interface{}{"dashboard": dashboard, "_server_session_id": req.SessionID},
 		req.OrgID, req.OrgName, req.ScopeOrgID)
-	if err != nil || result == nil || result.IsError {
+	if err != nil || result == nil {
 		return fmt.Errorf("artifact binding resolution failed; no dashboard was written")
+	}
+	if result.IsError {
+		return bindingResolutionError(extractText(result))
 	}
 	var resolved struct {
 		OK        bool                   `json:"ok"`
@@ -52,4 +55,27 @@ func (a *AgentLoop) resolveDashboardBindings(ctx context.Context, args map[strin
 	}
 	args["dashboard"] = resolved.Dashboard
 	return nil
+}
+
+const maxBindingErrorDetail = 500
+
+// bindingResolutionError relays the bridge's recoverable contract error so the
+// model can correct its bindings; anything else stays generic.
+func bindingResolutionError(text string) error {
+	var failure struct {
+		Error       string `json:"error"`
+		Recoverable bool   `json:"recoverable"`
+		Instruction string `json:"instruction"`
+	}
+	if err := json.Unmarshal([]byte(text), &failure); err != nil || !failure.Recoverable || failure.Error == "" {
+		return fmt.Errorf("artifact binding resolution failed; no dashboard was written")
+	}
+	detail := failure.Error
+	if failure.Instruction != "" {
+		detail += ". " + failure.Instruction
+	}
+	if len(detail) > maxBindingErrorDetail {
+		detail = strings.ToValidUTF8(detail[:maxBindingErrorDetail], "") + "…"
+	}
+	return fmt.Errorf("artifact binding resolution failed; no dashboard was written: %s", detail)
 }
