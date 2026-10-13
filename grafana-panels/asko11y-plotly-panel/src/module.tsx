@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { PanelPlugin } from "@grafana/data";
 import { useTheme2 } from "@grafana/ui";
 import Plotly from "plotly.js-dist-min";
+import { withRangebreakSafeTraces } from "./rangebreaks.mjs";
 import { resolveRenderMode } from "./renderMode.mjs";
 import { applyGrafanaTheme } from "./theme.mjs";
 
@@ -49,6 +50,7 @@ function PlotFigure({
     let active = true;
     // Plotly mutates inputs; the original figure must remain unchanged.
     const rendered = structuredClone(figure);
+    const data = withRangebreakSafeTraces(rendered.data, rendered.layout);
     const layout = applyGrafanaTheme(rendered.layout, theme);
     const config = {
       ...rendered.config,
@@ -58,7 +60,7 @@ function PlotFigure({
     };
     try {
       Promise.resolve(
-        Plotly.react(element, rendered.data, layout, config),
+        Plotly.react(element, data, layout, config),
       ).catch(() => {
         if (active) {
           onFailure();

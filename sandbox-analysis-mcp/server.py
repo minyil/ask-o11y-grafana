@@ -140,12 +140,17 @@ ACTIVE_CALLS: dict[tuple[str, ...], PendingCall] = {}
 ACTIVE_CALLS_LOCK = threading.Lock()
 
 
+# Plotly's WebGL traces draw nothing on an axis with rangebreaks.
+PLOTLY_RANGEBREAK_HINT = " When an axis uses rangebreaks (for example to hide a gap between time periods), use go.Scatter, not go.Scattergl or render_mode='webgl'."
+
+
 def _plotly_capability_description() -> str:
     capability = ml_plotly_contract.capability_summary()
     return (
         " Installed native Plotly presentation: "
         + json.dumps(capability, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + ". Figure rendering errors do not invalidate computation. Respect user restrictions; do not silently drop a figure or rerun an unknown computation."
+        + PLOTLY_RANGEBREAK_HINT
     )
 
 
@@ -168,7 +173,7 @@ TOOLS = [
     },
     {
         "name": "execute_python_preprocessing",
-        "description": "Execute generated Python over one or more authorized original uploaded CSV/XLSX documents of the same session in a fresh network-denied OpenSandbox when the user's request permits reading the original documents. The sandbox receives document_path, input_format, pd, np, emit, and emit_frame. When additional_document_refs are given it also receives documents: a list of {path, input_format, filename, sheet} for every document, primary first, so the code can read, merge, join, or append them with pandas. emit_frame returns both a derived_frame_ref and a session-owned derived_dataset_id for later Sandbox or Grafana Query steps. " + DERIVED_FRAME_LIMITS,
+        "description": "Execute generated Python over one or more authorized original uploaded CSV/XLSX documents of the same session in a fresh network-denied OpenSandbox when the user's request permits reading the original documents. The sandbox receives document_path, input_format, pd, np, emit, and emit_frame. When additional_document_refs are given it also receives documents: a list of {path, input_format, filename, sheet} for every document, primary first, so the code can read, merge, join, or append them with pandas. emit_frame returns both a derived_frame_ref and a session-owned derived_dataset_id for later Sandbox or Grafana Query steps. " + DERIVED_FRAME_LIMITS + PLOTLY_RANGEBREAK_HINT,
         "inputSchema": {
             "type": "object",
             "properties": {
