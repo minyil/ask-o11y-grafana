@@ -197,7 +197,13 @@ class ArtifactStore:
             self._durable_json(operation / "identity.json", [actor, kind, inputs])
             result = execute()
             result.setdefault("evidence", {})["operation_id"] = key
-            if (result.get("evidence") or {}).get("effect_outcome") == "indeterminate":
+            outcome = (result.get("evidence") or {}).get("effect_outcome")
+            if outcome == "indeterminate":
+                return result
+            if outcome == "terminated":
+                # A confirmed stop before any output leaves nothing to replay;
+                # forget the reservation so the same call can run again.
+                shutil.rmtree(operation, ignore_errors=True)
                 return result
             self._durable_json(operation / "completion.json", {"operation_id": key, "result": result})
             return result

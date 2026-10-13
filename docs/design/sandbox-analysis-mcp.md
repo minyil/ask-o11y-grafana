@@ -123,13 +123,15 @@ Every call creates and destroys one sandbox. No kernel persists across turns.
 | Control | Limit |
 | --- | ---: |
 | sandbox lifetime | 3600 seconds |
+| code start (one automatic retry) | 60 seconds |
+| code execution | 900 seconds |
 | CPU | 4 |
 | memory | 4 GiB |
 | source | 32 KiB |
 | input bundle | 16 MiB |
 | original uploaded document | 50 MiB, CSV/XLSX only |
-| captured execution | 5 MiB |
-| derived frame output | rejected; legacy bound 200 fields, 5,000 rows, 4 MiB |
+| captured execution | 32 MiB |
+| derived frame output | 200 fields, 50,000 rows, 16 MiB |
 | inline text/JSON | 32 KiB total |
 | signed CSV download | 4 MiB each, artifact-retention expiry |
 | output field summary | 200 fields |

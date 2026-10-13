@@ -67,22 +67,29 @@ PROTOCOL = "2025-03-26"
 MAX_CODE_BYTES = 32 * 1024
 MAX_RPC_BODY_BYTES = 128 * 1024
 MAX_INPUT_BUNDLE_BYTES = 16 * 1024 * 1024
-MAX_OUTPUT_BYTES = 5 * 1024 * 1024
+# Holds one derived frame (MAX_DERIVED_BYTES, JSON-escaped) plus the other outputs.
+MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 MAX_LOG_BYTES = 256 * 1024
 MAX_INLINE_RESULT_BYTES = 32 * 1024
 MAX_OUTPUT_FIELDS = 200
 MAX_OUTPUT_ITEMS = 64
-MAX_DERIVED_ROWS = 5_000
-MAX_DERIVED_BYTES = 4 * 1024 * 1024
+MAX_DERIVED_ROWS = 50_000
+MAX_DERIVED_BYTES = 16 * 1024 * 1024
 # One primary plus at most four additional uploads (the plugin's per-session
 # limit), bounded in total so a multi-file merge cannot exhaust sandbox memory.
 MAX_ADDITIONAL_DOCUMENTS = 4
 MAX_COMBINED_DOCUMENT_BYTES = 100 * 1024 * 1024
 DERIVED_FRAME_MIME = "application/vnd.ask-o11y.dataframe+json"
+DERIVED_FRAME_LIMITS = (
+    f"emit_frame accepts one DataFrame of at most {MAX_DERIVED_ROWS:,} rows, {MAX_OUTPUT_FIELDS} fields and "
+    f"{MAX_DERIVED_BYTES // (1024 * 1024)} MB; keep only the needed columns, or aggregate or resample, when the data is larger."
+)
 DEFAULT_SEED = 42
 DEFAULT_PRESENTATION_MODE = "plotly"
 PRESENTATION_MODES = ("plotly", "image")
 ARTIFACT_PUBLIC_BASE = os.environ.get("ARTIFACT_PUBLIC_BASE", "http://127.0.0.1:8777").rstrip("/")
+# Comma-separated browser origins allowed to fetch signed artifact assets.
+GRAFANA_PUBLIC_ORIGINS = frozenset(o.strip().rstrip("/") for o in os.environ.get("GRAFANA_PUBLIC_ORIGIN", "http://localhost:3000").split(",") if o.strip())
 ARTIFACTS = ArtifactStore(os.environ.get("ANALYSIS_ARTIFACT_ROOT", ROOT / ".analysis-artifacts" / "runs"))
 ARTIFACTS.cleanup_expired()
 
@@ -146,7 +153,7 @@ TOOLS = [
     {"name": "reconcile_operation", "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}, "description": "Recover a session-owned compute receipt from durable host completion evidence without running Python again. An indeterminate status is not success and never authorizes redispatch.", "inputSchema": {"type": "object", "additionalProperties": False, "properties": {"operation_id": {"type": "string", "pattern": "^[a-f0-9]{64}$", "description": "Omit to list recent owned operation statuses after a lost response; supply an ID to read its receipt."}}}},
     {
         "name": "execute_python_analysis",
-        "description": "Run generated Python in a fresh network-denied OpenSandbox over an authorized Grafana frame. Choose the method yourself; no ML or report contract is required. df, pd, np, emit(value, name=None), display and emit_frame are available. Emit Plotly figures directly, JSON summaries as *.json, and downloads as *.csv. Results include execution_ref and figure output_index for Dashboard bindings; arrays need not pass through the model. The image includes SciPy, Matplotlib, Seaborn, Plotly, scikit-learn, statsmodels, SHAP, XGBoost, LightGBM, imbalanced-learn and Optuna. Correct a completed Python failure on the same frame; never redispatch an unknown operation." + _plotly_capability_description(),
+        "description": "Run generated Python in a fresh network-denied OpenSandbox over an authorized Grafana frame. Choose the method yourself; no ML or report contract is required. df, pd, np, emit(value, name=None), display and emit_frame are available. Emit Plotly figures directly, JSON summaries as *.json, and downloads as *.csv. Results include execution_ref and figure output_index for Dashboard bindings; arrays need not pass through the model. The image includes SciPy, Matplotlib, Seaborn, Plotly, scikit-learn, statsmodels, SHAP, XGBoost, LightGBM, imbalanced-learn and Optuna. Correct a completed Python failure on the same frame; never redispatch an unknown operation. " + DERIVED_FRAME_LIMITS + _plotly_capability_description(),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -161,7 +168,7 @@ TOOLS = [
     },
     {
         "name": "execute_python_preprocessing",
-        "description": "Execute generated Python over one or more authorized original uploaded CSV/XLSX documents of the same session in a fresh network-denied OpenSandbox when the user's request permits reading the original documents. The sandbox receives document_path, input_format, pd, np, emit, and emit_frame. When additional_document_refs are given it also receives documents: a list of {path, input_format, filename, sheet} for every document, primary first, so the code can read, merge, join, or append them with pandas. emit_frame returns both a derived_frame_ref and a session-owned derived_dataset_id for later Sandbox or Grafana Query steps.",
+        "description": "Execute generated Python over one or more authorized original uploaded CSV/XLSX documents of the same session in a fresh network-denied OpenSandbox when the user's request permits reading the original documents. The sandbox receives document_path, input_format, pd, np, emit, and emit_frame. When additional_document_refs are given it also receives documents: a list of {path, input_format, filename, sheet} for every document, primary first, so the code can read, merge, join, or append them with pandas. emit_frame returns both a derived_frame_ref and a session-owned derived_dataset_id for later Sandbox or Grafana Query steps. " + DERIVED_FRAME_LIMITS,
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -241,10 +248,23 @@ def context_from_args(args: dict[str, Any]) -> dict[str, str]:
     raise WorkflowContractError("verified artifact context is required")
 
 
+def env_seconds(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def sandbox_policy() -> dict[str, Any]:
     return {
         "timeout_seconds": 3600,
         "ready_timeout_seconds": 3600,
+        # Submitted code that never reaches the kernel is retried once; code
+        # that runs past the execution budget is stopped. Neither waits for
+        # the hour-long sandbox lifetime.
+        "start_timeout_seconds": env_seconds("SANDBOX_START_TIMEOUT_SECONDS", 60),
+        "execution_timeout_seconds": env_seconds("SANDBOX_EXECUTION_TIMEOUT_SECONDS", 900),
         "resource": {"cpu": "4", "memory": "4Gi"},
         "network_default_action": "deny",
         "env": {},
@@ -471,7 +491,66 @@ def read_input_audit(filesystem: Any) -> dict[str, Any]:
     return audit
 
 
+EXECUTION_STARTED_MARKER = "ask-o11y-execution-started"
+
+
+class SandboxExecutionTimeout(Exception):
+    def __init__(self, started: bool):
+        super().__init__("sandbox execution timed out" if started else "sandbox never started the submitted code")
+        self.started = started
+
+
+class ExecutionWatchdog:
+    """Stops an owned sandbox whose code never starts or runs past its budget."""
+
+    def __init__(self, stop: Callable[[], None], start_timeout: float | None, execution_timeout: float):
+        self.stop = stop
+        self.started = threading.Event()
+        self.finished = threading.Event()
+        self.expired: bool | None = None
+        now = time.monotonic()
+        self.start_deadline = None if start_timeout is None else now + start_timeout
+        self.execution_deadline = now + execution_timeout
+        if start_timeout is None:
+            self.started.set()
+        self.thread = threading.Thread(target=self._watch, name="sandbox-execution-watchdog", daemon=True)
+        self.thread.start()
+
+    def observe_stdout(self, message: Any) -> None:
+        if EXECUTION_STARTED_MARKER in str(getattr(message, "text", "") or ""):
+            self.started.set()
+
+    def _watch(self) -> None:
+        while not self.finished.wait(0.5):
+            now = time.monotonic()
+            if not self.started.is_set() and self.start_deadline is not None and now >= self.start_deadline:
+                self.expired = False
+            elif now >= self.execution_deadline:
+                self.expired = True
+            else:
+                continue
+            with contextlib.suppress(Exception):
+                self.stop()
+            return
+
+    def finish(self) -> None:
+        self.finished.set()
+        self.thread.join(timeout=15)
+        if self.expired is not None:
+            raise SandboxExecutionTimeout(self.expired)
+
+
 def execute_opensandbox_input(input_path: str, input_data: str | bytes, source: str, *, capture_required: bool = True, extra_inputs: tuple[tuple[str, bytes], ...] = ()) -> dict[str, Any]:
+    try:
+        return _execute_opensandbox_once(input_path, input_data, source, capture_required=capture_required, extra_inputs=extra_inputs)
+    except SandboxExecutionTimeout as exc:
+        if exc.started:
+            raise
+    # The code never reached the kernel, so a fresh sandbox cannot repeat an effect.
+    return _execute_opensandbox_once(input_path, input_data, source, capture_required=capture_required, extra_inputs=extra_inputs)
+
+
+def _execute_opensandbox_once(input_path: str, input_data: str | bytes, source: str, *, capture_required: bool, extra_inputs: tuple[tuple[str, bytes], ...]) -> dict[str, Any]:
     from code_interpreter.models.code import SupportedLanguage
     from code_interpreter.sync.code_interpreter import CodeInterpreterSync
     from opensandbox.config import ConnectionConfigSync
@@ -506,17 +585,17 @@ def execute_opensandbox_input(input_path: str, input_data: str | bytes, source: 
             volumes=policy["volumes"],
             connection_config=connection,
         )
+        def stop_owned_sandbox():
+            manager = SandboxManagerSync.create(ConnectionConfigSync(
+                domain=settings["domain"], protocol=settings["protocol"],
+                api_key=os.environ.get("SANDBOX_API_KEY") or None,
+                request_timeout=timedelta(seconds=10),
+            ))
+            try:
+                manager.kill_sandbox(sandbox.id)
+            finally:
+                manager.close()
         if pending is not None:
-            def stop_owned_sandbox():
-                manager = SandboxManagerSync.create(ConnectionConfigSync(
-                    domain=settings["domain"], protocol=settings["protocol"],
-                    api_key=os.environ.get("SANDBOX_API_KEY") or None,
-                    request_timeout=timedelta(seconds=10),
-                ))
-                try:
-                    manager.kill_sandbox(sandbox.id)
-                finally:
-                    manager.close()
             pending.bind(stop_owned_sandbox)
         # The SDK's blocking readiness loop swallows cancellation exceptions.
         # Bind the owned ID first; check actual health without hiding cancellation.
@@ -531,11 +610,19 @@ def execute_opensandbox_input(input_path: str, input_data: str | bytes, source: 
             pending.check()
         sandbox.files.write_files([WriteEntry(path=path, data=data, mode=600) for path, data in ((input_path, input_data), *extra_inputs)])
         code_service = CodeInterpreterSync.create(sandbox=sandbox).codes
-        execution = code_service.run(
-            source,
-            language=SupportedLanguage.PYTHON,
-            handlers=ExecutionHandlersSync(skip_accumulation=capture_required),
-        )
+        watchdog = ExecutionWatchdog(stop_owned_sandbox, policy["start_timeout_seconds"] if capture_required else None, policy["execution_timeout_seconds"])
+        try:
+            execution = code_service.run(
+                # Captured runs redirect their own stdout, so the marker is the
+                # only stream event that proves the kernel received the code.
+                f"print({EXECUTION_STARTED_MARKER!r}, flush=True)\n{source}" if capture_required else source,
+                language=SupportedLanguage.PYTHON,
+                handlers=ExecutionHandlersSync(skip_accumulation=capture_required, on_stdout=watchdog.observe_stdout),
+            )
+        except Exception:
+            watchdog.finish()
+            raise
+        watchdog.finish()
         serialized = serialize_execution(execution)
         if pending is not None:
             pending.check()
@@ -792,6 +879,34 @@ def execute_python_analysis(
         return error_response(step=step, error=str(exc), recoverable=False, instruction="Do not repeat an indeterminate operation; inspect its existing execution evidence.")
 
 
+def sandbox_timeout_response(step: str, exc: SandboxExecutionTimeout) -> dict[str, Any]:
+    # The owned sandbox was stopped before any output was persisted, so the
+    # operation leaves no effect and the same call may be sent again.
+    if exc.started:
+        error = f"sandbox execution exceeded {sandbox_policy()['execution_timeout_seconds']} seconds and was stopped"
+        instruction = "The code ran too long. Send lighter code (fewer rows, columns or iterations), or the same call again if the work is expected to fit."
+    else:
+        error = "sandbox did not start the submitted code, even after one automatic retry"
+        instruction = "No code ran. Send the same call again; if this repeats, tell the user the sandbox runtime is unavailable."
+    return error_response(step=step, error=error, recoverable=True, instruction=instruction, evidence={"effect_outcome": "terminated"})
+
+
+# Fixed messages raised by the trusted capture helpers (emit, emit_frame).
+# They name only limits and output names, never row values, so they are
+# relayed to let the model correct an output that breaks a limit.
+OUTPUT_CONTRACT_ERRORS = tuple(re.compile(pattern) for pattern in (
+    r"derived frame must contain 1\.\.\d+ fields and at most \d+ rows",
+    r"derived frame exceeds \d+ bytes",
+    r"derived frame field names must be unique non-empty strings",
+    r"derived frame contains unsupported values",
+    r"only one derived frame may be emitted",
+    r"emit_frame requires a non-empty pandas DataFrame",
+    r"captured output [\w.-]+ exceeds \d+ bytes",
+    r"JSON output must contain JSON-serializable values",
+    r"Plotly figure JSON is not serializable",
+))
+
+
 def python_error_hint(error: Any, source: str) -> dict[str, Any]:
     """Expose the exception class and generated-code locations, never row values."""
     error = error if isinstance(error, dict) else {}
@@ -807,7 +922,17 @@ def python_error_hint(error: Any, source: str) -> dict[str, Any]:
             continue
         if 0 < line_number <= len(source.splitlines()):
             line_numbers.add(line_number)
-    return {"name": name, "line_numbers": sorted(line_numbers)}
+    hint: dict[str, Any] = {"name": name, "line_numbers": sorted(line_numbers)}
+    message = str(error.get("value") or "")
+    if name == "ValueError" and any(pattern.fullmatch(message) for pattern in OUTPUT_CONTRACT_ERRORS):
+        hint["output_contract"] = message
+    return hint
+
+
+def python_error_text(hint: dict[str, Any]) -> str:
+    if hint.get("output_contract"):
+        return f"Python {hint['name']} at generated code lines {hint['line_numbers']}: {hint['output_contract']}"
+    return f"Python {hint['name']} at generated code lines {hint['line_numbers']}"
 
 
 def _execute_python_analysis(
@@ -846,6 +971,8 @@ def _execute_python_analysis(
     code_sha256 = hashlib.sha256(code_bytes).hexdigest()
     try:
         execution = execute_opensandbox(frame_bundle_json, python_code, seed)
+    except SandboxExecutionTimeout as exc:
+        return sandbox_timeout_response(step, exc)
     except CancelledError:
         return error_response(step=step, error="analysis cancelled", recoverable=False,
                               instruction="Execution was cancelled; do not automatically restart it.", evidence={"effect_outcome": "cancelled"})
@@ -927,9 +1054,9 @@ def _execute_python_analysis(
     if execution_error:
         hint = python_error_hint(execution_error, python_code)
         return error_response(
-            step=step, error=f"Python {hint['name']} at generated code lines {hint['line_numbers']}",
+            step=step, error=python_error_text(hint),
             recoverable=True,
-            instruction="Python has finished with an error. Reuse the same frame_ref with corrected complete Python; do not query again. Raw exception values remain private.",
+            instruction="Python has finished with an error. Reuse the same frame_ref with corrected complete Python; do not query again. Raw exception values remain private except output limit messages.",
             evidence={"refs": refs, "frame_ref": frame_ref, "code_sha256": code_sha256, "python_error": hint},
         )
     return success_response(
@@ -1000,6 +1127,8 @@ def _execute_python_preprocessing(args: dict[str, Any]) -> dict[str, Any]:
     code_sha256 = hashlib.sha256(code_bytes).hexdigest()
     try:
         execution = execute_document_opensandbox(document_bytes, input_format, python_code, seed, additional, document)
+    except SandboxExecutionTimeout as exc:
+        return sandbox_timeout_response(step, exc)
     except CancelledError:
         return error_response(step=step, error="preprocessing cancelled", recoverable=False,
                               instruction="Execution was cancelled; do not automatically restart it.", evidence={"effect_outcome": "cancelled"})
@@ -1057,8 +1186,8 @@ def _execute_python_preprocessing(args: dict[str, Any]) -> dict[str, Any]:
     refs = {"execution_ref": execution_ref, "provenance_ref": provenance_ref, **derived_refs}
     if execution_error:
         hint = python_error_hint(execution_error, python_code)
-        return error_response(step=step, error=f"Python {hint['name']} at generated code lines {hint['line_numbers']}", recoverable=True,
-                              instruction="Python has finished with an error. Reuse the same document_ref and additional_document_refs with corrected complete code; raw exception values remain private.",
+        return error_response(step=step, error=python_error_text(hint), recoverable=True,
+                              instruction="Python has finished with an error. Reuse the same document_ref and additional_document_refs with corrected complete code; raw exception values remain private except output limit messages.",
                               evidence={"refs": refs, "document_ref": document_ref, "additional_document_refs": list(additional_refs), "code_sha256": code_sha256, "python_error": hint})
     return success_response(
         step=step,
@@ -1284,7 +1413,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "private, max-age=300")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Access-Control-Allow-Origin", os.environ.get("GRAFANA_PUBLIC_ORIGIN", "http://localhost:3000"))
+            origin = self.headers.get("Origin", "")
+            if origin in GRAFANA_PUBLIC_ORIGINS:
+                self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
             self.end_headers()
             self.wfile.write(data)
             return

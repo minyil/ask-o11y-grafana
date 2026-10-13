@@ -16,7 +16,8 @@ OUTPUT_DIR = Path("/tmp/sandbox-output")
 MAX_ITEM_BYTES = 4 * 1024 * 1024
 MAX_LOG_BYTES = 256 * 1024
 MAX_FRAME_FIELDS = 200
-MAX_FRAME_ROWS = 5_000
+MAX_FRAME_ROWS = 50_000
+MAX_FRAME_BYTES = 16 * 1024 * 1024
 DERIVED_FRAME_MIME = "application/vnd.ask-o11y.dataframe+json"
 
 
@@ -161,10 +162,10 @@ def execute(code: str, seed: int, namespace: dict[str, Any], audit: dict[str, An
         cleaned = " ".join(value.replace("\x00", "").split()).strip()
         return cleaned[:120] or fallback
 
-    def write(name: str, mime_type: str, value: str | bytes, display_name: str) -> None:
+    def write(name: str, mime_type: str, value: str | bytes, display_name: str, limit: int = MAX_ITEM_BYTES) -> None:
         payload = value.encode() if isinstance(value, str) else value
-        if len(payload) > MAX_ITEM_BYTES:
-            raise ValueError(f"captured output {name} exceeds {MAX_ITEM_BYTES} bytes")
+        if len(payload) > limit:
+            raise ValueError(f"captured output {name} exceeds {limit} bytes")
         path = OUTPUT_DIR / name
         path.write_bytes(payload)
         manifest.append({"path": str(path), "mime_type": mime_type, "display_name": display_name})
@@ -198,7 +199,9 @@ def execute(code: str, seed: int, namespace: dict[str, Any], audit: dict[str, An
             raise ValueError("derived frame contains unsupported values") from exc
         index = len(manifest) + 1
         display_name = label(name, index, f"Derived frame {index}")
-        write(f"derived-frame-{index}.json", DERIVED_FRAME_MIME, payload, display_name)
+        if len(payload.encode()) > MAX_FRAME_BYTES:
+            raise ValueError(f"derived frame exceeds {MAX_FRAME_BYTES} bytes")
+        write(f"derived-frame-{index}.json", DERIVED_FRAME_MIME, payload, display_name, MAX_FRAME_BYTES)
         emitted_frame = True
 
     def emit(value: Any, name: str | None = None) -> None:
