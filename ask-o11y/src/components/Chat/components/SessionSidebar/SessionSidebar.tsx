@@ -218,6 +218,7 @@ export function SessionSidebar({ sessionManager, currentSessionId, isOpen, onClo
                   onConfirmDelete={() => confirmDelete(session.id)}
                   onCancelDelete={() => setShowDeleteConfirm(null)}
                   onShare={() => setShareDialogSessionId(session.id)}
+                  onRename={(title) => sessionManager.renameSession(session.id, title)}
                   formatDate={formatDate}
                 />
               ))}
@@ -325,6 +326,9 @@ function formatTokenCount(tokens: number): string {
   return `${(tokens / 1000000).toFixed(1)}M`;
 }
 
+// Must match maxSessionTitleLen in pkg/plugin/plugin.go.
+const MAX_SESSION_TITLE_LENGTH = 200;
+
 interface SessionItemProps {
   session: SessionMetadata;
   isActive: boolean;
@@ -338,6 +342,7 @@ interface SessionItemProps {
   onConfirmDelete: () => void;
   onCancelDelete: () => void;
   onShare: () => void;
+  onRename: (title: string) => Promise<void>;
   formatDate: (date: Date | string) => string;
 }
 
@@ -354,8 +359,48 @@ function SessionItem({
   onConfirmDelete,
   onCancelDelete,
   onShare,
+  onRename,
   formatDate,
 }: SessionItemProps) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [draftTitle, setDraftTitle] = useState(session.title);
+  const [isSaving, setIsSaving] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
+
+  const startEditing = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setDraftTitle(session.title);
+    setRenameError(null);
+    setIsEditing(true);
+  };
+
+  const cancelEditing = () => {
+    setIsEditing(false);
+    setRenameError(null);
+  };
+
+  const saveTitle = async () => {
+    const trimmed = draftTitle.trim();
+    if (!trimmed) {
+      setRenameError('Title cannot be empty');
+      return;
+    }
+    if (trimmed === session.title) {
+      cancelEditing();
+      return;
+    }
+    setIsSaving(true);
+    setRenameError(null);
+    try {
+      await onRename(trimmed);
+      setIsEditing(false);
+    } catch (error: unknown) {
+      setRenameError(error instanceof Error ? error.message : 'Failed to rename');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   if (showDeleteConfirm) {
     return (
       <div className="p-2 bg-surface rounded border border-error">
@@ -386,7 +431,7 @@ function SessionItem({
   return (
     <div
       data-testid="session-item"
-      onClick={isLoading ? undefined : onLoad}
+      onClick={isLoading || isEditing ? undefined : onLoad}
       className={`p-1.5 rounded group transition-colors relative ${
         isActive
           ? 'bg-primary/10 border-l-2 border border-primary'
@@ -403,7 +448,59 @@ function SessionItem({
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1">
             {isActive && <Icon name="arrow-right" size="xs" className="text-primary flex-shrink-0" />}
-            <h3 className={`font-medium text-xs truncate ${isActive ? 'text-primary font-semibold' : 'text-primary'}`}>{session.title}</h3>
+            {isEditing ? (
+              <div className="flex-1 min-w-0" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center gap-0.5">
+                  <input
+                    data-testid="session-rename-input"
+                    autoFocus
+                    value={draftTitle}
+                    maxLength={MAX_SESSION_TITLE_LENGTH}
+                    disabled={isSaving}
+                    onChange={(e) => setDraftTitle(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        saveTitle();
+                      } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        cancelEditing();
+                      }
+                    }}
+                    onFocus={(e) => e.target.select()}
+                    aria-label="Conversation title"
+                    className="flex-1 min-w-0 px-1 py-0.5 text-xs rounded bg-background border border-medium text-primary focus:outline-none focus:border-primary disabled:opacity-50"
+                  />
+                  <button
+                    data-testid="session-rename-save"
+                    onClick={saveTitle}
+                    disabled={isSaving}
+                    className="p-0.5 hover:bg-surface rounded text-secondary hover:text-primary disabled:opacity-50 transition-colors"
+                    title="Save (Enter)"
+                  >
+                    <Icon name={isSaving ? 'fa fa-spinner' : 'check'} size="sm" />
+                  </button>
+                  <button
+                    data-testid="session-rename-cancel"
+                    onClick={cancelEditing}
+                    disabled={isSaving}
+                    className="p-0.5 hover:bg-surface rounded text-secondary hover:text-primary disabled:opacity-50 transition-colors"
+                    title="Cancel (Esc)"
+                  >
+                    <Icon name="times" size="sm" />
+                  </button>
+                </div>
+                {renameError && <p className="mt-0.5 text-xs text-error">{renameError}</p>}
+              </div>
+            ) : (
+              <h3
+                className={`font-medium text-xs truncate ${isActive ? 'text-primary font-semibold' : 'text-primary'}`}
+                title={`${session.title}\n(Double-click to rename)`}
+                onDoubleClick={startEditing}
+              >
+                {session.title}
+              </h3>
+            )}
           </div>
           <div className="flex items-center flex-wrap mt-0.5 text-xs text-secondary">
             <span>{formatDate(session.updatedAt)}</span>
@@ -430,7 +527,20 @@ function SessionItem({
           )}
         </div>
 
-        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+        <div
+          className={`flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity ${
+            isEditing ? 'hidden' : ''
+          }`}
+        >
+          <button
+            data-testid="session-rename-button"
+            onClick={startEditing}
+            disabled={isLoading}
+            className="p-0.5 hover:bg-surface rounded text-secondary hover:text-primary disabled:opacity-50 transition-colors"
+            title="Rename"
+          >
+            <Icon name="pen" size="sm" />
+          </button>
           <button
             data-testid="session-share-button"
             onClick={(e) => {

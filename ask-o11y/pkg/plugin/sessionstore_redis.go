@@ -384,7 +384,9 @@ func (s *RedisSessionStore) UpdateSession(sessionID string, userID, orgID int64,
 		if update.Model != nil {
 			session.Model = *update.Model
 		}
-		session.UpdatedAt = time.Now()
+		if !update.isTitleOnly() {
+			session.UpdatedAt = time.Now()
+		}
 	})
 }
 

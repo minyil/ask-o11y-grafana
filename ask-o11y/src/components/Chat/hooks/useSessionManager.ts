@@ -4,6 +4,7 @@ import { parseGrafanaLinks } from '../utils/grafanaLinkParser';
 import {
   listSessions,
   getSession,
+  updateSession,
   deleteSession as deleteBackendSession,
   deleteAllSessions as deleteAllBackendSessions,
   setCurrentSessionId,
@@ -18,6 +19,7 @@ export interface UseSessionManagerReturn {
   setCurrentSessionIdDirect: (sessionId: string) => void;
   createNewSession: () => void;
   loadSession: (sessionId: string) => Promise<void>;
+  renameSession: (sessionId: string, title: string) => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
   deleteAllSessions: () => Promise<void>;
   refreshSessions: () => Promise<SessionMetadata[]>;
@@ -107,9 +109,7 @@ export function useSessionManager(
         setCurrentSessionId_(session.id);
         setChatHistory(
           (session.messages as ChatMessage[]).map((message) =>
-            message.role === 'assistant'
-              ? { ...message, pageRefs: parseGrafanaLinks(message.content) }
-              : message
+            message.role === 'assistant' ? { ...message, pageRefs: parseGrafanaLinks(message.content) } : message
           )
         );
         setSessions((prev) => {
@@ -139,6 +139,16 @@ export function useSessionManager(
     },
     [setChatHistory, onSessionIdChange]
   );
+
+  // Throws on failure so the caller can keep the editor open and show the error.
+  const renameSession = useCallback(async (sessionId: string, title: string) => {
+    const trimmed = title.trim();
+    if (!trimmed) {
+      throw new Error('Title must not be empty');
+    }
+    await updateSession(sessionId, { title: trimmed });
+    setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, title: trimmed } : s)));
+  }, []);
 
   const deleteSessionFn = useCallback(
     async (sessionId: string) => {
@@ -172,6 +182,7 @@ export function useSessionManager(
     setCurrentSessionIdDirect: setCurrentSessionId_,
     createNewSession,
     loadSession,
+    renameSession,
     deleteSession: deleteSessionFn,
     deleteAllSessions: deleteAllSessionsFn,
     refreshSessions,

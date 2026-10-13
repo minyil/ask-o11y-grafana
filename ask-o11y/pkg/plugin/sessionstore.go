@@ -73,6 +73,13 @@ type SessionUpdate struct {
 	Model    *string          `json:"model,omitempty"`
 }
 
+// isTitleOnly reports whether the update only renames the session. A rename is
+// not conversation activity, so it must not bump UpdatedAt (which orders the
+// history list) — otherwise renamed sessions jump to the top.
+func (u SessionUpdate) isTitleOnly() bool {
+	return u.Title != nil && u.Messages == nil && u.Summary == nil && u.Model == nil
+}
+
 type SessionStoreInterface interface {
 	CreateSession(userID, orgID int64, title string, messages []SessionMessage) (*ChatSession, error)
 	GetSession(sessionID string, userID, orgID int64) (*ChatSession, error)
@@ -294,7 +301,9 @@ func (s *SessionStore) UpdateSession(sessionID string, userID, orgID int64, upda
 	if update.Model != nil {
 		session.Model = *update.Model
 	}
-	session.UpdatedAt = time.Now()
+	if !update.isTitleOnly() {
+		session.UpdatedAt = time.Now()
+	}
 
 	return nil
 }

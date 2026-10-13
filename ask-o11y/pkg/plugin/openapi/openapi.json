@@ -1337,7 +1337,9 @@
                   },
                   "title": {
                     "type": "string",
-                    "description": "New session title (optional)"
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "New session title (optional). Surrounding whitespace is trimmed; a blank or over-long title is rejected with 400."
                   },
                   "summary": {
                     "type": "string",

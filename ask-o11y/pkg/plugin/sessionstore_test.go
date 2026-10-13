@@ -354,3 +354,52 @@ func TestSessionStore_DeleteClearsCurrentSession(t *testing.T) {
 		t.Fatalf("expected empty current session after deleting it, got %q", id)
 	}
 }
+
+func TestSessionStore_RenameKeepsListOrder(t *testing.T) {
+	store := newTestSessionStore()
+
+	older, _ := store.CreateSession(1, 1, "older", []SessionMessage{{Role: "user", Content: "a"}})
+	time.Sleep(2 * time.Millisecond)
+	newer, _ := store.CreateSession(1, 1, "newer", []SessionMessage{{Role: "user", Content: "b"}})
+
+	before, _ := store.GetSession(older.ID, 1, 1)
+	beforeUpdatedAt := before.UpdatedAt
+
+	title := "renamed older"
+	if err := store.UpdateSession(older.ID, 1, 1, SessionUpdate{Title: &title}); err != nil {
+		t.Fatalf("UpdateSession failed: %v", err)
+	}
+
+	got, _ := store.GetSession(older.ID, 1, 1)
+	if !got.UpdatedAt.Equal(beforeUpdatedAt) {
+		t.Fatalf("rename bumped UpdatedAt: before %v, after %v", beforeUpdatedAt, got.UpdatedAt)
+	}
+
+	sessions, err := store.ListSessions(1, 1)
+	if err != nil {
+		t.Fatalf("ListSessions failed: %v", err)
+	}
+	if len(sessions) != 2 || sessions[0].ID != newer.ID || sessions[1].ID != older.ID || sessions[1].Title != title {
+		t.Fatalf("expected [newer, renamed older], got %+v", sessions)
+	}
+}
+
+func TestSessionStore_NonTitleUpdateBumpsUpdatedAt(t *testing.T) {
+	store := newTestSessionStore()
+
+	session, _ := store.CreateSession(1, 1, "s", []SessionMessage{{Role: "user", Content: "a"}})
+	before, _ := store.GetSession(session.ID, 1, 1)
+	beforeUpdatedAt := before.UpdatedAt
+	time.Sleep(2 * time.Millisecond)
+
+	title := "renamed"
+	summary := "summary"
+	if err := store.UpdateSession(session.ID, 1, 1, SessionUpdate{Title: &title, Summary: &summary}); err != nil {
+		t.Fatalf("UpdateSession failed: %v", err)
+	}
+
+	got, _ := store.GetSession(session.ID, 1, 1)
+	if !got.UpdatedAt.After(beforeUpdatedAt) {
+		t.Fatalf("expected UpdatedAt to advance, before %v, after %v", beforeUpdatedAt, got.UpdatedAt)
+	}
+}

@@ -269,3 +269,36 @@ func TestRedisSessionStore_UploadsListAndLegacyField(t *testing.T) {
 		t.Fatalf("legacy upload was not removable: %v", stored.UploadDatasetIDs)
 	}
 }
+
+func TestRedisSessionStore_RenameKeepsUpdatedAt(t *testing.T) {
+	client := createTestRedisClient(t)
+	defer client.Close()
+
+	store := NewRedisSessionStore(context.Background(), client, log.DefaultLogger, resolveTTLDays(0, DefaultSessionTTLDays))
+	session, err := store.CreateSession(1, 1, "test", []SessionMessage{{Role: "user", Content: "initial"}})
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	defer func() { _ = store.DeleteSession(session.ID, 1, 1) }()
+
+	before, err := store.GetSession(session.ID, 1, 1)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+
+	title := "renamed"
+	if err := store.UpdateSession(session.ID, 1, 1, SessionUpdate{Title: &title}); err != nil {
+		t.Fatalf("UpdateSession failed: %v", err)
+	}
+
+	got, err := store.GetSession(session.ID, 1, 1)
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if got.Title != title {
+		t.Fatalf("title = %q, want %q", got.Title, title)
+	}
+	if !got.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("rename bumped UpdatedAt: before %v, after %v", before.UpdatedAt, got.UpdatedAt)
+	}
+}

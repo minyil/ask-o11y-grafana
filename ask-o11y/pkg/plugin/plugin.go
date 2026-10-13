@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/attribute"
 
@@ -2760,6 +2761,18 @@ func (p *Plugin) handleSessionRouter(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Session model can only be set by agent run creation", http.StatusBadRequest)
 			return
 		}
+		if update.Title != nil {
+			title := strings.TrimSpace(*update.Title)
+			if title == "" {
+				http.Error(w, "Session title must not be empty", http.StatusBadRequest)
+				return
+			}
+			if utf8.RuneCountInString(title) > maxSessionTitleLen {
+				http.Error(w, fmt.Sprintf("Session title must be at most %d characters", maxSessionTitleLen), http.StatusBadRequest)
+				return
+			}
+			update.Title = &title
+		}
 		if err := p.sessionStore.UpdateSession(sessionID, userID, orgID, update); err != nil {
 			http.Error(w, "Session not found", http.StatusNotFound)
 			return
@@ -2848,6 +2861,10 @@ func (p *Plugin) handleGetSessionStats(w http.ResponseWriter, r *http.Request, s
 		"updatedAt":        session.UpdatedAt,
 	})
 }
+
+// maxSessionTitleLen caps user-supplied titles on rename; generated titles are
+// truncated separately (see generateSessionTitleFromType).
+const maxSessionTitleLen = 200
 
 func generateSessionTitleFromType(convType, message string) string {
 	const maxTitleLen = 50

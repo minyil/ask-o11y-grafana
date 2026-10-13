@@ -22,6 +22,7 @@ jest.mock('@grafana/runtime', () => ({
 jest.mock('../../../../services/backendSessionClient', () => ({
   listSessions: jest.fn(() => new Promise(() => {})),
   getSession: jest.fn(),
+  updateSession: jest.fn(),
   deleteSession: jest.fn(),
   deleteAllSessions: jest.fn(),
   getCurrentSessionId: jest.fn(),

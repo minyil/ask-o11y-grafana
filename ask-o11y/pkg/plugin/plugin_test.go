@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"consensys-asko11y-app/pkg/agent"
 	"consensys-asko11y-app/pkg/mcp"
 	"consensys-asko11y-app/pkg/skills"
@@ -866,5 +867,67 @@ func TestContextLimitsFromSettings(t *testing.T) {
 	empty := contextLimitsFromSettings(PluginSettings{})
 	if empty != (agent.ContextLimits{}) {
 		t.Fatalf("expected zero-value passthrough, got %+v", empty)
+	}
+}
+
+func TestHandleSessionRouter_RenameSession(t *testing.T) {
+	tests := []struct {
+		name       string
+		title      string
+		wantStatus int
+		wantTitle  string
+	}{
+		{name: "trims and saves title", title: "  Checkout latency spike  ", wantStatus: http.StatusOK, wantTitle: "Checkout latency spike"},
+		{name: "rejects blank title", title: "   ", wantStatus: http.StatusBadRequest, wantTitle: "hi"},
+		{name: "rejects overlong title", title: strings.Repeat("字", maxSessionTitleLen+1), wantStatus: http.StatusBadRequest, wantTitle: "hi"},
+		{name: "accepts title at max length", title: strings.Repeat("字", maxSessionTitleLen), wantStatus: http.StatusOK, wantTitle: strings.Repeat("字", maxSessionTitleLen)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newAgentRunTestPlugin(t)
+			session, err := p.sessionStore.CreateSession(7, 2, "", []SessionMessage{{Role: "user", Content: "hi"}})
+			if err != nil {
+				t.Fatalf("CreateSession failed: %v", err)
+			}
+
+			body, _ := json.Marshal(map[string]string{"title": tt.title})
+			req := httptest.NewRequest(http.MethodPut, "/api/sessions/"+session.ID, bytes.NewReader(body))
+			req.Header.Set("X-Grafana-Org-Id", "2")
+			req.Header.Set("X-Grafana-User-Id", "7")
+			rec := httptest.NewRecorder()
+
+			p.handleSessionRouter(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			got, err := p.sessionStore.GetSession(session.ID, 7, 2)
+			if err != nil {
+				t.Fatalf("GetSession failed: %v", err)
+			}
+			if got.Title != tt.wantTitle {
+				t.Errorf("title = %q, want %q", got.Title, tt.wantTitle)
+			}
+		})
+	}
+}
+
+func TestHandleSessionRouter_RenameSessionNotFoundForWrongOwner(t *testing.T) {
+	p := newAgentRunTestPlugin(t)
+	session, err := p.sessionStore.CreateSession(7, 2, "", []SessionMessage{{Role: "user", Content: "hi"}})
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/sessions/"+session.ID, strings.NewReader(`{"title":"hijacked"}`))
+	req.Header.Set("X-Grafana-Org-Id", "2")
+	req.Header.Set("X-Grafana-User-Id", "999")
+	rec := httptest.NewRecorder()
+
+	p.handleSessionRouter(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }
