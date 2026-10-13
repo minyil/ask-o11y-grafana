@@ -24,7 +24,7 @@ func (a *AgentLoop) resolveDashboardBindings(ctx context.Context, args map[strin
 		return fmt.Errorf("invalid dashboard arguments")
 	}
 	opaque := false
-	for _, marker := range []string{`"$execution_ref"`, `"askO11yPlotlyBindings"`, `"askO11yAssetBindings"`} {
+	for _, marker := range []string{`"$execution_ref"`, `"askO11yPlotlyBindings"`, `"askO11yAssetBindings"`, `"askO11ySimulatorBindings"`} {
 		opaque = opaque || strings.Contains(string(encoded), marker)
 	}
 	if !opaque {

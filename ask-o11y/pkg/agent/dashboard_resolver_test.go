@@ -106,3 +106,19 @@ func TestBindingResolutionErrorRelaysOnlyRecoverableContractErrors(t *testing.T)
 		t.Fatalf("long detail was not truncated safely: %d bytes", len(got))
 	}
 }
+
+func TestSimulatorBindingsRouteThroughBridge(t *testing.T) {
+	loop, _, cleanup := setupTestLoop(t, nil)
+	defer cleanup()
+	defer loop.mcpProxy.Close()
+	// Even a binding missing its $execution_ref must reach the bridge, which rejects it, rather than be written as is.
+	args := map[string]interface{}{"dashboard": map[string]interface{}{"panels": []interface{}{map[string]interface{}{
+		"type":                     "asko11y-simulator-panel",
+		"options":                  map[string]interface{}{"model": "$simulator_main"},
+		"askO11ySimulatorBindings": []interface{}{map[string]interface{}{"placeholder": "$simulator_main", "output_index": 1}},
+	}}}}
+	err := loop.resolveDashboardBindings(context.Background(), args, LoopRequest{SessionID: "owned-session"})
+	if err == nil || !strings.Contains(err.Error(), "no dashboard was written") && !strings.Contains(err.Error(), "artifact bridge is disabled") {
+		t.Fatalf("simulator binding was not routed to the bridge: %v", err)
+	}
+}

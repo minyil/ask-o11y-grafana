@@ -1,0 +1,19 @@
+{
+  "name": "asko11y-simulator-panel",
+  "version": "0.3.0",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/test-model.mjs",
+    "build": "npm run typecheck && npm test && rm -rf dist && webpack --config webpack.config.cjs && node scripts/check-bundle.cjs && cp src/plugin.json dist/plugin.json && mkdir -p dist/img && cp src/img/logo.svg dist/img/logo.svg"
+  },
+  "devDependencies": {
+    "@swc/core": "1.13.3",
+    "@types/react": "18.3.23",
+    "react": "18.3.1",
+    "swc-loader": "0.2.6",
+    "typescript": "5.5.4",
+    "webpack": "5.105.3",
+    "webpack-cli": "6.0.1"
+  }
+}

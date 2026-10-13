@@ -8,3 +8,4 @@ services:
     volumes:
       - ./ask-o11y/dist:/var/lib/grafana/plugins/consensys-asko11y-app:ro
       - ./grafana-panels/asko11y-plotly-panel/dist:/var/lib/grafana/plugins/asko11y-plotly-panel:ro
+      - ./grafana-panels/asko11y-simulator-panel/dist:/var/lib/grafana/plugins/asko11y-simulator-panel:ro

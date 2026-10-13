@@ -106,6 +106,7 @@ func TestBundledSkillsAllParse(t *testing.T) {
 		"analyzing-performance",
 		"analyzing-traces",
 		"building-dashboards",
+		"building-simulators",
 		"investigating-alerts",
 		"optimizing-metrics-cost",
 		"querying-profiles",

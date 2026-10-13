@@ -37,6 +37,7 @@ mcp_security = load_module("mcp_security", ROOT / "mcp_security.py")
 artifact_assets = load_module("artifact_assets", ROOT / "artifact_assets.py")
 ml_plotly_contract = load_module("ml_plotly_contract", ROOT / "ml_plotly_contract.py")
 ml_dashboard_contract = load_module("ml_dashboard_contract", ROOT / "ml_dashboard_contract.py")
+simulator_model = load_module("simulator_model", ROOT / "simulator_model.py")
 ArtifactAuthError = artifact_store.ArtifactAuthError
 ArtifactStore = artifact_store.ArtifactStore
 WorkflowContractError = workflow_node.WorkflowContractError
@@ -202,6 +203,47 @@ def resolve_plotly_bindings(context: dict[str, str], panel: dict[str, Any], coun
     return panel
 
 
+def resolve_simulator_bindings(context: dict[str, str], panel: dict[str, Any], counters: dict[str, int]) -> dict[str, Any]:
+    """Resolve askO11ySimulatorBindings: a validated simulator model becomes options.model."""
+    is_simulator = panel.get("type") == simulator_model.PANEL_ID
+    bindings = panel.pop("askO11ySimulatorBindings", None)
+    if bindings is None:
+        if is_simulator:
+            raise WorkflowContractError(f"{simulator_model.PANEL_ID} panels need askO11ySimulatorBindings; never inline the model")
+        return panel
+    if not is_simulator:
+        raise WorkflowContractError(f"askO11ySimulatorBindings are only valid on {simulator_model.PANEL_ID} panels")
+    if not isinstance(bindings, list) or len(bindings) != 1 or not isinstance(bindings[0], dict):
+        raise WorkflowContractError("a simulator panel needs exactly one simulator binding")
+    binding = bindings[0]
+    if set(binding) != {"placeholder", "$execution_ref", "output_index", "plugin_id"}:
+        raise WorkflowContractError(f"simulator binding must have exactly the keys placeholder, $execution_ref, output_index, plugin_id; got {sorted(binding)}")
+    placeholder, execution_ref, output_index = binding["placeholder"], binding["$execution_ref"], binding["output_index"]
+    if binding["plugin_id"] != simulator_model.PANEL_ID:
+        raise WorkflowContractError(f"simulator binding plugin id is not the approved {simulator_model.PANEL_ID}")
+    if not isinstance(execution_ref, str) or isinstance(output_index, bool) or not isinstance(output_index, int) or output_index < 0:
+        raise WorkflowContractError("simulator binding requires an opaque execution ref and non-negative output index")
+    if parse_artifact_ref(execution_ref)[1] != ("sandbox-execution",):
+        raise WorkflowContractError("simulator binding must reference a sandbox-execution artifact")
+    options = panel.get("options")
+    if not isinstance(options, dict) or options.get("model") != placeholder or not isinstance(placeholder, str) or not placeholder.startswith("$simulator_"):
+        raise WorkflowContractError("simulator panels need options.model set to the binding placeholder, which starts with $simulator_")
+    if set(options) != {"model"}:
+        raise WorkflowContractError("simulator panel options may contain only model")
+    execution = ARTIFACTS.read_json(context, execution_ref)
+    try:
+        result = execution["results"][output_index]
+        spec = json.loads(result["mime"]["application/json"])
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise WorkflowContractError("simulator output index does not hold a simulator model") from exc
+    try:
+        simulator_model.validate_spec(spec)
+    except simulator_model.SimulatorError as exc:
+        raise WorkflowContractError(f"simulator model rejected: {exc}") from exc
+    counters["simulators"] += 1
+    return {**panel, "options": {"model": spec}}
+
+
 def resolve_asset_bindings(context: dict[str, str], panel: dict[str, Any], counters: dict[str, int]) -> dict[str, Any]:
     if "/assets/" in json.dumps(panel, ensure_ascii=False):
         raise WorkflowContractError("model-authored dashboard must use opaque asset bindings, not asset URLs")
@@ -272,6 +314,7 @@ def resolve_panels(context: dict[str, str], panels: Any, counters: dict[str, int
         nested_panels = raw_item.pop("panels", None)
         item = resolve_asset_bindings(context, raw_item, counters)
         item = resolve_plotly_bindings(context, item, counters)
+        item = resolve_simulator_bindings(context, item, counters)
         targets = item.get("targets", [])
         if not isinstance(targets, list):
             raise WorkflowContractError("dashboard panel targets must be an array")
@@ -297,7 +340,7 @@ def resolve_dashboard_refs(args: dict[str, Any]) -> dict[str, Any]:
         if len(json.dumps(dashboard, ensure_ascii=False).encode()) > MAX_DASHBOARD_BYTES:
             raise WorkflowContractError("dashboard exceeds resolver size limit")
         output = json_clone(dashboard)
-        counters = {"panels": 0, "targets": 0, "assets": 0, "plotly": 0}
+        counters = {"panels": 0, "targets": 0, "assets": 0, "plotly": 0, "simulators": 0}
         output["panels"] = resolve_panels(context, output.get("panels", []), counters)
     except (ArtifactAuthError, PermissionError) as exc:
         return error_response(step=step, error=f"unauthorized artifact access: {exc}", recoverable=False, instruction="Stop; the opaque dashboard binding is not authorized for this context.")
@@ -312,7 +355,7 @@ def resolve_dashboard_refs(args: dict[str, Any]) -> dict[str, Any]:
         run_id="run_" + uuid.uuid4().hex,
         refs={},
         instruction="Internal host result: dispatch the resolved dashboard only to Ask O11y's built-in Grafana MCP; never expose it to the model.",
-        evidence={"resolved_panels": counters["panels"], "resolved_targets": counters["targets"], "resolved_assets": counters["assets"], "resolved_plotly": counters["plotly"]},
+        evidence={"resolved_panels": counters["panels"], "resolved_targets": counters["targets"], "resolved_assets": counters["assets"], "resolved_plotly": counters["plotly"], "resolved_simulators": counters["simulators"]},
         dashboard=output,
     )
 

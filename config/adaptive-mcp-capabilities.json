@@ -13,7 +13,7 @@
       "name": "Isolated Dynamic Python Analysis",
       "url_env": "SANDBOX_ANALYSIS_MCP_URL",
       "local_url": "http://127.0.0.1:8777/mcp",
-      "enabled_tools": ["reconcile_operation", "execute_python_analysis", "execute_python_preprocessing", "list_python_analyses", "inspect_python_analysis", "revise_python_analysis"],
+      "enabled_tools": ["reconcile_operation", "execute_python_analysis", "execute_python_preprocessing", "build_simulator_model", "list_python_analyses", "inspect_python_analysis", "revise_python_analysis"],
       "disabled_tools": []
     },
     {

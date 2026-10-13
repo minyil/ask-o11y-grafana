@@ -11,7 +11,7 @@ services:
       - GF_RENDERING_SERVER_URL=http://127.0.0.1:8081/render
       - GF_RENDERING_CALLBACK_URL=http://127.0.0.1:3000/
       - GF_RENDERING_RENDERER_TOKEN=${GRAFANA_RENDERER_TOKEN:?Set GRAFANA_RENDERER_TOKEN in .env}
-      - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=consensys-asko11y-app,asko11y-plotly-panel,grafana-llm-app
+      - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=consensys-asko11y-app,asko11y-plotly-panel,asko11y-simulator-panel,grafana-llm-app
     volumes:
       - grafana-data:/var/lib/grafana
       - ./config/grafana.ini:/etc/grafana/grafana.ini:ro

@@ -1,0 +1,30 @@
+{
+  "type": "panel",
+  "name": "Ask O11y Simulator",
+  "id": "asko11y-simulator-panel",
+  "skipDataQuery": true,
+  "info": {
+    "description": "What-if sliders over a data-trained model exported by scripts/train-simulator-model.py.",
+    "author": {
+      "name": "Ask O11y"
+    },
+    "keywords": [
+      "simulation",
+      "what-if",
+      "machine-learning",
+      "ask-o11y"
+    ],
+    "logos": {
+      "small": "img/logo.svg",
+      "large": "img/logo.svg"
+    },
+    "links": [],
+    "screenshots": [],
+    "version": "0.3.0",
+    "updated": "2026-10-13"
+  },
+  "dependencies": {
+    "grafanaDependency": ">=11.0.0",
+    "plugins": []
+  }
+}

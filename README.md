@@ -27,8 +27,9 @@ Prerequisites: Docker (user in the `docker` group), `uv`, Node 22+, Go 1.26 (pla
    ```sh
    (cd ask-o11y && npm ci --ignore-scripts) && GO_BIN=$PWD/.scratch/go/bin/go scripts/build-install-ask-o11y.sh
    (cd grafana-panels/asko11y-plotly-panel && npm ci && npm run build)
+   (cd grafana-panels/asko11y-simulator-panel && npm ci && npm run build)
    ```
-   `compose.override.yaml` serves both `dist/` directories straight into Grafana.
+   `compose.override.yaml` serves the `dist/` directories straight into Grafana.
 3. **Build the sandbox images**
    ```sh
    uv sync && uv tool install opensandbox-server==0.2.2
@@ -55,3 +56,46 @@ Chat sessions, share links and approvals live in Redis (`redis-data` volume, AOF
 
 OpenSandbox runs with `runc` here for development only; production needs gVisor/Kata and a non-loopback,
 TLS asset gateway (see `sandbox-analysis-mcp/README.md`).
+
+## What-if simulator
+
+In Ask O11y: upload a CSV/XLSX in the chat and ask for a simulation page ("調整參數時，某溫度會上升或下降多少").
+The `building-simulators` skill makes the assistant propose targets, slider features (excluding co-moving outcomes),
+category, filtering, resampling and hold span, and wait for confirmation. It then trains with the sandbox tool
+`build_simulator_model`, which runs the fixed code in `simulator_model.py` inside OpenSandbox, not generated Python. It
+explains validation and effects, and only on request writes a dashboard: an `asko11y-simulator-panel` whose
+`options.model` is a `$simulator_*` placeholder bound with `askO11ySimulatorBindings`. After write approval the
+artifact bridge validates the trained model (format, structure, parity) and fills it in. Live check:
+`scripts/run-simulator-e2e.py` (upload → sandbox training → bridge resolution and refusals).
+
+Locally, without Ask O11y:
+
+`scripts/train-simulator-model.py` fits a model on any CSV (numeric target and slider columns) and
+publishes a dashboard with the `asko11y-simulator-panel`: one slider per feature, live predictions for
+each target, and per-feature response curves computed in the browser.
+
+```sh
+set -a; . ./.env; set +a
+uv run scripts/train-simulator-model.py data/u1_by_date.csv \
+  --target 主蒸汽溫度_C --target 再熱蒸汽溫度_C \
+  --feature 燃燒器角度_度 --feature 火上風門開度_FCP --feature 保證時段發電量_avg_MW \
+  --feature 用煤量合計_保證 --feature 平均熱值_保證_kcalkg --feature 冷凝器出口水溫_C \
+  --time-column 日期 --title "1號機 蒸汽溫度模擬" --publish
+```
+
+`--model linear` (default) gives smooth responses; `--model trees` (gradient boosting) and `--model forest`
+(random forest, 100 trees, depth ≤ 8) capture non-linearity but respond in steps; `--model auto` keeps whichever
+validates best. With `--time-column`, validation holds out whole days (rows of one
+day share slow drifts) and also trains on the past to predict later rows; without it, a shuffled k-fold
+is used. The panel shows these scores and warns when they are weak.
+
+Minute-level process data: filter and average before training, and add a categorical column such as the
+product. The panel then shows a dropdown; slider baselines and the "rarely seen" bands follow the chosen
+product, and products with fewer than three days of data are flagged.
+
+```sh
+uv run scripts/train-simulator-model.py ../和平廠/4C_20260806-0909_1min_含產品.csv \
+  --target 4FTI23_4C磨機出口耳軸承溫度 --feature 4FTI37_4C磨出口氣溫 --feature ... \
+  --category 產品 --time-column 時間 --where '運轉狀態 == 1' --resample 30min --model trees --publish
+```
+Predictions describe associations in the data, not the effect of intervening on a parameter.

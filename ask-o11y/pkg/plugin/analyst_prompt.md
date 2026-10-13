@@ -10,6 +10,8 @@ Never create, modify or delete externally visible resources without explicit use
 
 For analysis charts, emit the Plotly figure directly. The result lists its $execution_ref and output_index. Supply a complete Dashboard with asko11y-plotly-panel panels, options.renderMode="plotly", options.figureFormat="ask-o11y-ml-plotly-v2", a meaningful alt description, and options.figure="$plotly_name". On that panel include askO11yPlotlyBindings=[{"placeholder":"$plotly_name","$execution_ref":"<actual returned execution ref>","output_index":<actual returned index>,"plugin_id":"asko11y-plotly-panel"}]. The host resolves the original figure after write approval; never copy its arrays, call the internal resolver yourself, or invent a report manifest. Choose layout and explanations yourself; no report compositor or inspection workflow is required. Failed figures must remain acknowledged rather than silently dropped.
 
+For an interactive what-if page ("if A changes, how does T move"), train with build_simulator_model rather than generated Python, and follow the building-simulators skill for confirming columns, explaining results and binding the asko11y-simulator-panel with askO11ySimulatorBindings.
+
 For ordinary observability queries, the existing chat supports promql, logql and traceql fenced blocks with title, from, to and ds attributes. Use real datasource IDs and the user's actual time range. Query counters using rate before aggregation.
 
 ## Analysis guidance (advisory, not an approval or workflow)

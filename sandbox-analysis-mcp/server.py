@@ -46,6 +46,7 @@ mcp_security = load_module("mcp_security", ROOT / "mcp_security.py")
 artifact_assets = load_module("artifact_assets", ROOT / "artifact_assets.py")
 uploaded_datasets = load_module("uploaded_datasets", ROOT / "uploaded_datasets.py")
 ml_plotly_contract = load_module("ml_plotly_contract", ROOT / "sandbox-analysis-mcp/ml_plotly_contract.py")
+simulator_model = load_module("simulator_model", ROOT / "simulator_model.py")
 ArtifactStore = artifact_store.ArtifactStore
 ArtifactAuthError = artifact_store.ArtifactAuthError
 WorkflowContractError = workflow_node.WorkflowContractError
@@ -185,6 +186,27 @@ TOOLS = [
             "required": ["document_ref", "python_code"],
             "additionalProperties": False
         }
+    },
+    {
+        "name": "build_simulator_model",
+        "description": "Train a what-if simulator from one authorized uploaded CSV/XLSX document of this session, using fixed trusted training code in a fresh network-denied OpenSandbox (no generated Python). Use it when the user wants an interactive page to see how adjusting parameters changes an outcome (e.g. 'if A goes up, how much does the temperature change'). Features become sliders and must be numeric columns the user can set or that describe operating conditions; never use other outcomes of the same process (co-moving temperatures, downstream measurements) as features. Confirm targets and features with the user before calling. Returns validation scores, per-feature effects and warnings to explain to the user, and a $execution_ref/output_index binding for an asko11y-simulator-panel. Load the building-simulators skill before building the dashboard.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_ref": {"type": "string", "description": "Opaque uploaded-document ref returned by Grafana Query inspect_dataset."},
+                "targets": {"type": "array", "minItems": 1, "maxItems": simulator_model.MAX_TARGETS, "uniqueItems": True, "items": {"type": "string", "maxLength": simulator_model.MAX_TEXT}, "description": "Numeric outcome columns to predict."},
+                "features": {"type": "array", "minItems": 1, "maxItems": simulator_model.MAX_FEATURES, "uniqueItems": True, "items": {"type": "string", "maxLength": simulator_model.MAX_TEXT}, "description": "Numeric columns exposed as sliders."},
+                "category": {"type": "string", "maxLength": simulator_model.MAX_TEXT, "description": "Optional categorical column (e.g. product or mode). The model includes it and the panel offers a selector; slider ranges follow the chosen value."},
+                "time_column": {"type": "string", "maxLength": simulator_model.MAX_TEXT, "description": "Optional timestamp/date column. Enables validation that holds out whole days and predicts later rows from earlier ones; strongly recommended for process data."},
+                "where": {"type": "string", "maxLength": 500, "description": "Optional pandas query keeping rows, e.g. '運轉狀態 == 1'. Wrap column names with spaces or symbols in backticks."},
+                "resample": {"type": "string", "pattern": "^[1-9][0-9]{0,3}(min|h)$", "description": "Optional window (e.g. 30min) that averages high-frequency rows before training. Needs time_column."},
+                "hold": {"type": "string", "pattern": "^[1-9][0-9]{0,3}(min|h)$", "description": "Optional trailing span (e.g. 2h): each feature becomes its average over that span, so a slider means 'held there that long'. Use for slow responses such as thermal inertia. Needs resample."},
+                "model": {"type": "string", "enum": [*simulator_model.MODEL_KINDS, "auto"], "default": "auto", "description": "linear gives smooth responses; trees (gradient boosting) and forest (random forest) capture non-linearity with stepwise responses; auto trains all three and keeps whichever validates best."},
+                "title": {"type": "string", "maxLength": 80, "description": "Panel title shown to the user."},
+            },
+            "required": ["document_ref", "targets", "features"],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "list_python_analyses",
@@ -1207,6 +1229,129 @@ def _execute_python_preprocessing(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+SIMULATOR_PARAMS = ("targets", "features", "category", "time_column", "where", "resample", "hold", "model", "title")
+
+
+def simulator_program(params: dict[str, Any], sheet: Any) -> str:
+    """Fixed training source plus a driver; user values enter only as one JSON literal."""
+    payload = json.dumps(params, ensure_ascii=False)
+    return Path(simulator_model.__file__).read_text(encoding="utf-8") + f"""
+
+import json as _json
+_params = _json.loads({payload!r})
+_sheet = {json.dumps(sheet if isinstance(sheet, str) else None, ensure_ascii=False)!r}
+if input_format == "xlsx":
+    _raw = pd.read_excel(document_path, sheet_name=_json.loads(_sheet) or 0)
+else:
+    _raw = pd.read_csv(document_path, encoding="utf-8-sig")
+try:
+    _spec, _report = build_spec(_raw, **_params)
+except SimulatorError as _exc:
+    # Contract messages name columns and counts, never row values; relay them so the request can be corrected.
+    emit({{"format": REPORT_FORMAT, "error": str(_exc)}}, name="simulator-error.json")
+else:
+    emit(_report, name="simulator-report.json")
+    emit(_spec, name="simulator-model.json")
+"""
+
+
+MAX_SIMULATOR_REPORT_BYTES = 24 * 1024
+
+
+def simulator_outputs(execution: Any) -> dict[str, tuple[int, dict[str, Any]]]:
+    """JSON outputs of a simulator training run by display name, with their result index."""
+    found = {}
+    for index, item in enumerate(execution.get("results", []) if isinstance(execution, dict) else []):
+        mime = item.get("mime") if isinstance(item, dict) else None
+        name = item.get("display_name") if isinstance(item, dict) else None
+        if isinstance(mime, dict) and isinstance(mime.get("application/json"), str) and name in {"simulator-error.json", "simulator-report.json", "simulator-model.json"}:
+            value = json.loads(mime["application/json"])
+            if isinstance(value, dict):
+                found[name] = (index, value)
+    return found
+
+
+def compact_simulator_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Keep the model-visible report bounded: drop per-level effects beyond the default level if needed."""
+    if len(json.dumps(report, ensure_ascii=False).encode()) <= MAX_SIMULATOR_REPORT_BYTES:
+        return report
+    effects = report.get("effects_p05_to_p95") or []
+    first = effects[0].get("level") if effects else None
+    trimmed = {**report, "effects_p05_to_p95": [e for e in effects if e.get("level") == first], "effects_note": "effects shown for the default level only"}
+    if len(json.dumps(trimmed, ensure_ascii=False).encode()) <= MAX_SIMULATOR_REPORT_BYTES:
+        return trimmed
+    return {**trimmed, "effects_p05_to_p95": [], "effects_note": "effects omitted: too many targets/features to list"}
+
+
+def build_simulator_model(args: dict[str, Any]) -> dict[str, Any]:
+    step = "build_simulator_model"
+    try:
+        context = context_from_args(args)
+        inputs = {key: value for key, value in args.items() if key not in {"context", "_server_context"}}
+        return ARTIFACTS.run_once(context, step, inputs, lambda: _build_simulator_model(args))
+    except (PermissionError, WorkflowContractError, OSError, TypeError, ValueError) as exc:
+        return error_response(step=step, error=str(exc), recoverable=False, instruction="Reconcile any pending operation before retrying.")
+
+
+def _build_simulator_model(args: dict[str, Any]) -> dict[str, Any]:
+    step = "build_simulator_model"
+    document_ref = args.get("document_ref")
+    params = {key: args[key] for key in SIMULATOR_PARAMS if args.get(key) is not None}
+    params.setdefault("model", "auto")
+    for key in ("targets", "features"):
+        if not isinstance(params.get(key), list) or not params[key] or any(not isinstance(v, str) or not v for v in params[key]):
+            return error_response(step=step, error=f"{key} must be a non-empty list of column names", recoverable=True, instruction="Pass the confirmed column names exactly as inspect_dataset returned them.")
+    for key in ("category", "time_column", "where", "resample", "hold", "model", "title"):
+        if key in params and not isinstance(params[key], str):
+            return error_response(step=step, error=f"{key} must be a string", recoverable=True, instruction="Pass only the declared argument types.")
+    if not isinstance(document_ref, str):
+        return error_response(step=step, error="document_ref is required", recoverable=False, instruction="Stop; inspect an authorized uploaded dataset first.")
+    try:
+        _raw, document = read_authorized_document(context_from_args(args), document_ref)
+    except (PermissionError, OSError, WorkflowContractError, ValueError, TypeError) as exc:
+        return error_response(step=step, error=str(exc), recoverable=False, instruction="Stop; the uploaded document is invalid or unauthorized.")
+    params["source_name"] = Path(str(document.get("filename") or "uploaded data")).stem or "uploaded data"
+    result = _execute_python_preprocessing({
+        "document_ref": document_ref,
+        "python_code": simulator_program(params, document.get("sheet")),
+        "seed": DEFAULT_SEED,
+        "_server_context": args["_server_context"],
+    })
+    if not result.get("ok"):
+        return {**result, "step": step, "instruction": "Training did not complete. Report this to the user; do not retry with generated Python."}
+    execution_ref = (result.get("refs") or {}).get("execution_ref")
+    try:
+        outputs = simulator_outputs(ARTIFACTS.read_json(context_from_args(args), execution_ref))
+    except (PermissionError, OSError, WorkflowContractError, ValueError, TypeError, KeyError) as exc:
+        return error_response(step=step, error=f"simulator outputs are unreadable: {type(exc).__name__}", recoverable=False,
+                              instruction="Stop and report the failure; do not retry with generated Python.", evidence={"refs": result.get("refs")})
+    if "simulator-error.json" in outputs:
+        message = outputs["simulator-error.json"][1].get("error")
+        return error_response(step=step, error=str(message or "training rejected the request")[:500], recoverable=True,
+                              instruction="Correct the column choice or options (or ask the user), then call build_simulator_model again.",
+                              evidence={"refs": result.get("refs")})
+    if "simulator-report.json" not in outputs or "simulator-model.json" not in outputs:
+        return error_response(step=step, error="training finished without a simulator model output", recoverable=False,
+                              instruction="Stop and report the failure; do not retry with generated Python.", evidence={"refs": result.get("refs")})
+    report = compact_simulator_report(outputs["simulator-report.json"][1])
+    return success_response(
+        step=step,
+        run_id=result["run_id"],
+        refs=result["refs"],
+        instruction=("Explain the validation scores, effects and warnings to the user in plain language before or with the dashboard: "
+                     "the model shows associations in the data, not proven effects of intervening. To publish, load the building-simulators "
+                     "skill and bind this output with askO11ySimulatorBindings; never copy the model JSON."),
+        evidence=result.get("evidence") or {},
+        simulator={
+            "$execution_ref": execution_ref,
+            "output_index": outputs["simulator-model.json"][0],
+            "plugin_id": simulator_model.PANEL_ID,
+            "model_format": simulator_model.MODEL_FORMAT,
+        },
+        report=report,
+    )
+
+
 def read_provenance(context: dict[str, str], provenance_ref: str) -> dict[str, Any]:
     _run_id, parts = parse_artifact_ref(provenance_ref)
     if parts != ("sandbox-provenance",):
@@ -1344,6 +1489,7 @@ def handle_rpc(msg: dict[str, Any]):
                 "reconcile_operation": reconcile_operation,
                 "execute_python_analysis": execute_python_analysis,
                 "execute_python_preprocessing": execute_python_preprocessing,
+                "build_simulator_model": build_simulator_model,
                 "list_python_analyses": list_python_analyses,
                 "inspect_python_analysis": inspect_python_analysis,
                 "revise_python_analysis": revise_python_analysis,
